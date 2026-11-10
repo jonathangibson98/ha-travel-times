@@ -95,6 +95,8 @@ geo_fail = {}
 req_times = deque()      # timestamps of recent Waze calls
 paused_until = 0.0
 mq = None
+group_cache = {}         # gid -> last published payload
+group_live = {}          # gid -> live info for the UI
 
 
 # ----------------------------------------------------------------- helpers
@@ -115,6 +117,7 @@ def load_cfg():
     c = load_json(CFG_FILE, {})
     c.setdefault("people", [])
     c.setdefault("destinations", [])
+    c.setdefault("groups", [])
     if "routes" not in c:  # older versions tracked every person -> every destination
         c["routes"] = [{"from": p["id"], "to": d["id"]} for p in c["people"] for d in c["destinations"]]
     s = dict(DEFAULT_SETTINGS)
@@ -123,18 +126,37 @@ def load_cfg():
     return c
 
 
-def pairs_of(c):
-    """{(from_person_id, to_id): (person, endpoint)}; the endpoint is a place or another person."""
-    people = {p["id"]: p for p in c["people"]}
+def endpoints_of(c):
+    """Every person (as a possible destination) and every place, by id."""
     ends = {p["id"]: {"id": p["id"], "name": p["name"], "target": p["entity"], "is_person": True}
             for p in c["people"]}
     for d in c["destinations"]:
         ends[d["id"]] = d
+    return ends
+
+
+def pairs_of(c):
+    """Visible routes: {(from_person_id, to_id): (person, endpoint)}; one sensor each."""
+    people = {p["id"]: p for p in c["people"]}
+    ends = endpoints_of(c)
     out = {}
     for r in c.get("routes", []):
         p, d = people.get(r.get("from")), ends.get(r.get("to"))
         if p and d and p["id"] != d["id"]:
             out[(p["id"], d["id"])] = (p, d)
+    return out
+
+
+def all_pairs(c):
+    """Visible routes plus the member routes that group sensors need."""
+    out = dict(pairs_of(c))
+    people = {p["id"]: p for p in c["people"]}
+    ends = endpoints_of(c)
+    for g in c.get("groups", []):
+        d = ends.get(g.get("to"))
+        for m in g.get("members", []):
+            if d and m in people and m != d["id"]:
+                out.setdefault((m, d["id"]), (people[m], d))
     return out
 
 
@@ -291,6 +313,85 @@ def rate_ok(limit):
     return len(req_times) < limit
 
 
+# ------------------------------------------------------------- group sensors
+def group_disc_topic(gid):
+    return f"homeassistant/sensor/{BASE}_group_{gid}/config"
+
+
+def publish_group_discovery(g, ends):
+    d = ends.get(g["to"])
+    if not d:
+        return
+    payload = {
+        "name": f"To {d['name']}",
+        "unique_id": f"{BASE}_group_{g['id']}",
+        "default_entity_id": f"sensor.{slug(g['name'])}_to_{slug(d['name'])}",
+        "state_topic": f"{BASE}/group/{g['id']}/state",
+        "json_attributes_topic": f"{BASE}/group/{g['id']}/attrs",
+        "availability_topic": STATUS_TOPIC,
+        "unit_of_measurement": "min",
+        "device_class": "duration",
+        "state_class": "measurement",
+        "icon": "mdi:account-group",
+        "device": {"identifiers": [f"{BASE}_group_{g['id']}"], "name": f"{g['name']} Travel Times",
+                   "manufacturer": "Travel Times add-on", "model": "Group travel time"},
+    }
+    pub(group_disc_topic(g["id"]), json.dumps(payload))
+
+
+def group_state(c, g, snap):
+    """(minutes, attrs) for a group, or None until every member has a result."""
+    people = {p["id"]: p for p in c["people"]}
+    ends = endpoints_of(c)
+    d = ends.get(g["to"])
+    if not d:
+        return None
+    members, unit = [], None
+    for m in g["members"]:
+        st = snap.get(f"{m}|{g['to']}", {})
+        if m not in people or st.get("minutes") is None:
+            return None
+        unit = st.get("unit") or unit
+        members.append({"name": people[m]["name"], "minutes": st["minutes"],
+                        "distance": st.get("distance") or 0, "arrived": bool(st.get("arrived"))})
+    mins = [x["minutes"] for x in members]
+    mode = g.get("mode", "max")
+    minutes = round({"max": max(mins), "min": min(mins), "sum": sum(mins)}[mode], 1)
+    now = datetime.now().astimezone()
+    attrs = {
+        "mode": mode, "members": members, "member_count": len(members),
+        "total_minutes": round(sum(mins), 1), "longest_minutes": round(max(mins), 1),
+        "shortest_minutes": round(min(mins), 1),
+        "total_distance": round(sum(x["distance"] for x in members), 1), "distance_unit": unit,
+        "arrived": all(x["arrived"] for x in members),
+        "eta": (now + timedelta(minutes=minutes if mode != "sum" else max(mins))).isoformat(timespec="seconds"),
+        "last_calculated": now.isoformat(timespec="seconds"),
+        "destination": d["target"],
+    }
+    return minutes, attrs
+
+
+def publish_groups():
+    with lock:
+        c = json.loads(json.dumps(cfg))
+        snap = {k: dict(v) for k, v in status.items()}
+    for g in c.get("groups", []):
+        res = group_state(c, g, snap)
+        if not res:
+            continue
+        minutes, attrs = res
+        key = json.dumps([minutes, attrs["members"], attrs["mode"]])
+        with lock:
+            group_live[g["id"]] = {"minutes": minutes, "unit": attrs["distance_unit"], "t": time.time(),
+                                   "members": attrs["members"], "total_distance": attrs["total_distance"],
+                                   "arrived": attrs["arrived"], "mode": attrs["mode"], "error": None}
+            if group_cache.get(g["id"]) == key:
+                continue
+            group_cache[g["id"]] = key
+        pub(f"{BASE}/group/{g['id']}/state", str(minutes))
+        pub(f"{BASE}/group/{g['id']}/attrs", json.dumps(attrs))
+
+
 # --------------------------------------------------------------------- MQTT
 def pub(topic, payload, retain=True):
     if mq is not None:
@@ -337,6 +438,11 @@ def republish_all():
     for (pid, did), (p, d) in pairs_of(c).items():
         publish_discovery(p, d)
         publish_state(pid, did, snap.get(f"{pid}|{did}", {}))
+    ends = endpoints_of(c)
+    for g in c.get("groups", []):
+        publish_group_discovery(g, ends)
+    group_cache.clear()
+    publish_groups()
 
 
 def on_connect(client, userdata, flags, rc):
@@ -403,7 +509,8 @@ def record_result(p, d, st, minutes, dist_m, via, s, arrived):
         "origin": p["entity"],
         "destination": d["target"],
     }
-    publish_state(p["id"], d["id"], st)
+    if (p["id"], d["id"]) in pairs_of(cfg):
+        publish_state(p["id"], d["id"], st)
 
 
 def tick():
@@ -412,7 +519,7 @@ def tick():
         c = json.loads(json.dumps(cfg))
     s = c["settings"]
     now = time.time()
-    routes = pairs_of(c)
+    routes = all_pairs(c)
     if not routes:
         return
 
@@ -479,6 +586,10 @@ def worker():
             tick()
         except Exception:
             log.exception("tick crashed")
+        try:
+            publish_groups()
+        except Exception:
+            log.exception("group publish crashed")
         try:
             maybe_auto_backup()
         except Exception:
@@ -600,6 +711,19 @@ def clean_cfg(body):
             done.add((f, t))
             routes.append({"from": f, "to": t})
 
+    groups = []
+    for g in (body.get("groups") or [])[:20]:
+        name = str(g.get("name", "")).strip()[:40]
+        to = idmap.get(str(g.get("to")))
+        members = []
+        for m in g.get("members") or []:
+            m = idmap.get(str(m))
+            if m in person_ids and m != to and m not in members:
+                members.append(m)
+        if name and to in valid_to and len(members) >= 2:
+            groups.append({"id": new_id(g.get("id")), "name": name, "members": members[:8], "to": to,
+                           "mode": g.get("mode") if g.get("mode") in ("max", "min", "sum") else "max"})
+
     b = body.get("settings") or {}
     s = dict(DEFAULT_SETTINGS)
     s["region"] = b.get("region") if b.get("region") in WAZE_URLS else "US"
@@ -616,25 +740,32 @@ def clean_cfg(body):
     s["backup_dir"] = safe_dir(str(b.get("backup_dir") or "").strip()) or DEFAULT_SETTINGS["backup_dir"]
     s["backup_auto"] = b.get("backup_auto") if b.get("backup_auto") in ("off", "daily", "weekly") else "off"
     s["backup_keep"] = clamp(b.get("backup_keep"), 1, 100, 10)
-    return {"people": people, "destinations": dests, "routes": routes, "settings": s}
+    return {"people": people, "destinations": dests, "routes": routes, "groups": groups, "settings": s}
 
 
 def apply_cfg(new):
     global cfg
     with lock:
         old = cfg
-        old_pairs, new_pairs = pairs_of(old), pairs_of(new)
-        for (pid, did) in old_pairs.keys() - new_pairs.keys():
-            pub(disc_topic(pid, did), "")  # empty payload = delete the entity
+        old_v, new_v = pairs_of(old), pairs_of(new)
+        for key in old_v.keys() - new_v.keys():
+            pub(disc_topic(*key), "")  # empty payload = delete the entity
+        old_a, new_a = all_pairs(old), all_pairs(new)
+        for (pid, did) in old_a.keys() - new_a.keys():
             status.pop(f"{pid}|{did}", None)
         # anything whose source/target changed gets recalculated right away
-        for key, (p, d) in new_pairs.items():
-            if key in old_pairs:
-                op, od = old_pairs[key]
+        for key, (p, d) in new_a.items():
+            if key in old_a:
+                op, od = old_a[key]
                 if op["entity"] != p["entity"] or od["target"] != d["target"]:
                     st = status.get(f"{key[0]}|{key[1]}", {})
                     st.pop("t", None)
                     st.pop("arrived", None)
+        gone = {g["id"] for g in old.get("groups", [])} - {g["id"] for g in new.get("groups", [])}
+        for gid in gone:
+            pub(group_disc_topic(gid), "")
+            group_cache.pop(gid, None)
+            group_live.pop(gid, None)
         cfg = new
         save_json(CFG_FILE, new)
     republish_all()
@@ -721,8 +852,11 @@ def nocache(resp):
 
 def status_public():
     with lock:
-        return {k: {x: v.get(x) for x in ("minutes", "distance", "unit", "t", "error", "arrived", "via")}
-                for k, v in status.items()}
+        out = {k: {x: v.get(x) for x in ("minutes", "distance", "unit", "t", "error", "arrived", "via")}
+               for k, v in status.items()}
+        for gid, v in group_live.items():
+            out[f"g|{gid}"] = v
+        return out
 
 
 @app.get("/")
@@ -903,7 +1037,7 @@ button.d{color:var(--bad)}button.ico{padding:8px 12px;font-size:18px}button:disa
 label.l{display:block;font-size:13px;color:var(--mu);margin-bottom:4px}
 .hint{font-size:12px;color:var(--mu);margin-top:4px}
 .seg{display:flex;background:#12121f;border:1px solid var(--line);border-radius:12px;padding:3px;margin-bottom:12px}
-.seg button{flex:1;border:0;background:transparent;min-height:40px}.seg button.on{background:var(--ac);color:#04121c;font-weight:700}
+.seg button{flex:1;border:0;background:transparent;min-height:40px;padding:6px 4px;font-size:14px}.seg button.on{background:var(--ac);color:#04121c;font-weight:700}
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
 .chip{display:flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--line);border-radius:20px;font-size:14px}
 .nav{position:fixed;left:0;right:0;bottom:0;z-index:6;display:flex;background:#0d0d0dfa;border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
@@ -921,7 +1055,7 @@ label.l{display:block;font-size:13px;color:var(--mu);margin-bottom:4px}
 <section id="p-live" class="pg"><div id="live"><div class="sub">Loading…</div></div></section>
 <section id="p-setup" class="pg hid">
  <div class="seg" id="seg"></div>
- <div id="s-people"></div><div id="s-places" class="hid"></div><div id="s-routes" class="hid"></div>
+ <div id="s-people"></div><div id="s-places" class="hid"></div><div id="s-routes" class="hid"></div><div id="s-groups" class="hid"></div>
 </section>
 <section id="p-find" class="pg hid">
  <div class="card stack">
@@ -957,14 +1091,18 @@ function go(k){
   if(k==='backup')loadBackups();window.scrollTo(0,0);
 }
 async function load(){
-  const r=await fetch('api/config');S=await r.json();S.config.routes=S.config.routes||[];
+  const r=await fetch('api/config');S=await r.json();S.config.routes=S.config.routes||[];S.config.groups=S.config.groups||[];
   $('#dl').innerHTML=[...S.zones,...S.trackers].map(o=>`<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
   dirty=false;$('#savebar').classList.add('hid');renderAll();
 }
-function renderAll(){renderSeg();renderPeople();renderDests();renderRoutes();renderSearchOpts();renderSettings();renderBackup();renderLive(S.status)}
-function dropRoutes(id){S.config.routes=S.config.routes.filter(r=>r.from!==id&&r.to!==id)}
+function renderAll(){renderSeg();renderPeople();renderDests();renderRoutes();renderGroups();renderSearchOpts();renderSettings();renderBackup();renderLive(S.status)}
+function dropRoutes(id){
+  S.config.routes=S.config.routes.filter(r=>r.from!==id&&r.to!==id);
+  S.config.groups.forEach(g=>{g.members=g.members.filter(m=>m!==id)});
+  S.config.groups=S.config.groups.filter(g=>g.to!==id&&g.members.length>=2);
+}
 function renderSeg(){
-  const C=S.config,t=[['people','People',C.people.length],['places','Places',C.destinations.length],['routes','Routes',C.routes.length]];
+  const C=S.config,t=[['people','People',C.people.length],['places','Places',C.destinations.length],['routes','Routes',C.routes.length],['groups','Groups',C.groups.length]];
   $('#seg').innerHTML=t.map(([k,l,n])=>`<button class="${sub===k?'on':''}" onclick="setSub('${k}')">${l} (${n})</button>`).join('');
   t.forEach(([k])=>$('#s-'+k).classList.toggle('hid',k!==sub));
 }
@@ -1015,6 +1153,33 @@ function renderRoutes(){
   const fill=document.createElement('button');fill.textContent='Everyone → all places';fill.onclick=fillAll;
   const w=document.createElement('div');w.className='stack';w.append(add,fill);el.append(w);
   el.insertAdjacentHTML('beforeend','<div class="hint">Each route is one sensor. Pick a person as the "To" to track person to person.</div>');
+}
+const MODES=[['max','Longest: when everyone has arrived'],['min','Shortest: first one there'],['sum','Combined total of everyone']];
+function renderGroups(){
+  const el=$('#s-groups');el.innerHTML='';
+  const P=S.config.people,D=S.config.destinations;
+  const dopt=(D.length?`<optgroup label="Places">${D.map(d=>`<option value="${esc(d.id)}">${esc(d.name||'(unnamed)')}</option>`).join('')}</optgroup>`:'')+(P.length?`<optgroup label="People (live)">${P.map(p=>`<option value="${esc(p.id)}">${esc(p.name||'(unnamed)')}</option>`).join('')}</optgroup>`:'');
+  S.config.groups.forEach((g,i)=>{
+    const c=card();
+    const nm=document.createElement('input');nm.placeholder='Group name (Jon & Sam)';nm.value=g.name||'';nm.oninput=()=>{g.name=nm.value;touch();renderLive(S.status)};
+    const mem=document.createElement('div');mem.innerHTML='<div class="sub">People in this group (2 or more)</div>';
+    const chips=document.createElement('div');chips.className='chips';
+    P.forEach(p=>{
+      const l=document.createElement('label');l.className='chip';
+      const k=document.createElement('input');k.type='checkbox';k.checked=g.members.includes(p.id);
+      k.onchange=()=>{g.members=k.checked?[...g.members,p.id]:g.members.filter(x=>x!==p.id);touch()};
+      l.append(k,p.name||'(unnamed)');chips.append(l);
+    });
+    mem.append(chips);
+    const to=document.createElement('select');to.innerHTML='<option value="">To…</option>'+dopt;to.value=g.to||'';to.onchange=()=>{g.to=to.value;touch();renderLive(S.status)};
+    const md=selCtl(MODES,g.mode||'max',v=>{g.mode=v;touch()});
+    const rm=document.createElement('button');rm.className='d';rm.textContent='Remove group';rm.onclick=()=>{S.config.groups.splice(i,1);touch();renderGroups();renderSeg();renderLive(S.status)};
+    c.append(nm,mem,to,md,rm);el.append(c);
+  });
+  const add=document.createElement('button');add.className='p';add.textContent='+ Add group';
+  add.onclick=()=>{S.config.groups.push({id:rid(),name:'',members:S.config.people.slice(0,2).map(p=>p.id),to:'',mode:'max'});touch();renderGroups();renderSeg()};
+  el.append(add);
+  el.insertAdjacentHTML('beforeend','<div class="hint">A group is one sensor for several people going to the same place, e.g. you and your partner heading home. The sensor shows the time by the rule you pick, and its attributes list each person plus the combined total time and distance.</div>');
 }
 function fillAll(){
   for(const p of S.config.people)for(const d of S.config.destinations)
@@ -1093,6 +1258,18 @@ function renderLive(st){
   const by={};
   for(const r of S.config.routes){if(r.from&&r.to&&r.from!==r.to)(by[r.from]=by[r.from]||[]).push(r)}
   let out='';
+  const gl=S.config.groups.filter(g=>g.to&&g.members.length>1);
+  if(gl.length){
+    out+='<h2>Groups</h2>';
+    for(const g of gl){
+      const x=st['g|'+g.id]||{};let big='…',sb='waiting for everyone\'s first calculation';
+      if(x.minutes!=null){
+        big=x.arrived?'Here':Math.round(x.minutes)+' min';
+        sb=x.members.map(m=>`${esc(m.name)} ${m.arrived?'here':Math.round(m.minutes)+' min'}`).join(' · ')+` · ${x.total_distance} ${x.unit||''} combined`;
+      }
+      out+=`<div class="card live"><div><b>👥 ${esc(g.name||'(unnamed)')} → ${esc(nameOf(g.to))}</b><div class="sub">${sb}</div></div><div class="big">${big}</div></div>`;
+    }
+  }
   for(const p of S.config.people){
     if(!by[p.id])continue;out+=`<h2>${esc(p.name||'(unnamed)')}</h2>`;
     for(const r of by[p.id]){
