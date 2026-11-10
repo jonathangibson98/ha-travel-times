@@ -8,7 +8,12 @@
 
 ## Use
 - People: name + the person/device_tracker that holds their GPS.
-- Destinations: a zone, another person (follows them live), "lat, lon", or a street address.
+- Places: a zone, "lat, lon", or a street address.
+- Routes: each route is one sensor. "From" is a person; "To" is a place or another person (follows them live).
+  Existing setups keep their sensors; use "Everyone -> all places" to fill in every combination.
+- Find a place (AI): choose an `ai_task` entity in Settings, type e.g. "closest Lowe's", pick Near Home or a person, and tap Add.
+  The model suggests places, the add-on geocodes the addresses for accurate coordinates, and the place is added with routes for the people ticked.
+  Results are only as good as the model's knowledge; a model with web search gives the best results.
 - Save. Sensors appear under Settings > Devices & services > MQTT.
 
 ## How "real time" works
