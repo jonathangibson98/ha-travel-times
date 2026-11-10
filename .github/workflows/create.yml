@@ -1,0 +1,195 @@
+name: Publish add-on images to GHCR
+
+# Builds a prebuilt image for every Home Assistant add-on in this repo (any folder with a
+# config.yaml/json that has a `slug` and a Dockerfile) and pushes it to GitHub's container registry:
+#
+#   ghcr.io/<owner>/<arch>-addon-<slug>:<version>   (and :latest)
+#
+# or whatever the add-on's own `image:` line says. No tags or releases needed:
+#   * Push to main      -> builds only add-ons whose `version` has no image yet.
+#   * Bump `version` in an add-on's config.yaml, commit, push -> that add-on gets built.
+#   * Actions tab > "Run workflow" -> tick "force" to rebuild every add-on.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild every add-on even if its version already has an image'
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-addon-images
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+      has_work: ${{ steps.find.outputs.has_work }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR (to see which versions already exist)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find add-ons that need an image
+        id: find
+        env:
+          OWNER: ${{ github.repository_owner }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          OWNER="${OWNER,,}"
+          entries='[]'
+
+          while IFS= read -r cfg; do
+            cfg="${cfg#./}"
+            dir="$(dirname "$cfg")"
+            cj="$(yq -o=json '.' "$cfg" 2>/dev/null || echo '{}')"
+            slug="$(jq -r 'if type=="object" then (.slug // empty) else empty end' <<<"$cj")"
+            [ -n "$slug" ] || continue
+            if [ "$dir" = "." ]; then df="Dockerfile"; else df="$dir/Dockerfile"; fi
+            [ -f "$df" ] || continue
+
+            version="$(jq -r '.version // "latest"' <<<"$cj")"
+            name="$(jq -r '.name // empty' <<<"$cj")"; [ -n "$name" ] || name="$slug"
+            desc="$(jq -r '.description // empty' <<<"$cj" | tr -d '\n')"
+            tmpl="$(jq -r '.image // empty' <<<"$cj")"
+            [ -n "$tmpl" ] || tmpl="ghcr.io/$OWNER/{arch}-addon-$slug"
+
+            bj='{}'
+            for b in build.yaml build.yml build.json; do
+              if [ -f "$dir/$b" ]; then bj="$(yq -o=json '.' "$dir/$b")"; break; fi
+            done
+
+            archs="$(jq -r '(.arch // ["amd64","aarch64"]) | .[]' <<<"$cj")"
+            for arch in $archs; do
+              case "$arch" in
+                amd64)   plat=linux/amd64 ;;
+                aarch64) plat=linux/arm64 ;;
+                armv7)   plat=linux/arm/v7 ;;
+                *) continue ;;
+              esac
+              image="${tmpl//\{arch\}/$arch}"
+              image="${image,,}"
+
+              if [ "$FORCE" != "true" ] && docker buildx imagetools inspect "$image:$version" >/dev/null 2>&1; then
+                echo "skip  $image:$version (already published)"
+                continue
+              fi
+
+              bf="$(jq -r --arg a "$arch" '.build_from[$a] // empty' <<<"$bj")"
+              # Old per-arch bases (aarch64-base, amd64-base...) no longer exist as multi-platform
+              # images and fail with "no match for platform". Use the combined base image instead.
+              bf="$(sed -E 's#^ghcr\.io/home-assistant/(amd64|aarch64|armv7|armhf|i386)-base#ghcr.io/home-assistant/base#' <<<"$bf")"
+              entries="$(jq -c \
+                --arg image "$image" --arg dockerfile "$df" --arg context "$dir" \
+                --arg platforms "$plat" --arg arch "$arch" --arg version "$version" \
+                --arg build_from "$bf" --arg addon_name "$name" --arg description "$desc" \
+                '. + [{image:$image, dockerfile:$dockerfile, context:$context,
+                       platforms:$platforms, arch:$arch, version:$version,
+                       build_from:$build_from, addon_name:$addon_name, description:$description}]' \
+                <<<"$entries")"
+              echo "build $image:$version"
+            done
+          done < <(find . -type f \( -name config.yaml -o -name config.yml -o -name config.json \) \
+                     -not -path './.git/*' -not -path '*/node_modules/*' | sort)
+
+          if [ "$(jq 'length' <<<"$entries")" = 0 ]; then
+            echo "Nothing to build: every add-on version already has an image. Bump a version to publish a new one."
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+          else
+            echo "has_work=true" >> "$GITHUB_OUTPUT"
+            echo "matrix=$(jq -c '{include: .}' <<<"$entries")" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: ${{ matrix.image }}
+    needs: discover
+    if: needs.discover.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare build args
+        id: args
+        env:
+          BUILD_FROM: ${{ matrix.build_from }}
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          {
+            echo 'build_args<<EOF'
+            if [ -n "$BUILD_FROM" ]; then echo "BUILD_FROM=$BUILD_FROM"; fi
+            echo "BUILD_ARCH=$ARCH"
+            echo "BUILD_VERSION=$VERSION"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Metadata (Home Assistant add-on labels and tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ matrix.image }}
+          tags: |
+            type=raw,value=${{ matrix.version }}
+            type=raw,value=latest
+          labels: |
+            io.hass.type=addon
+            io.hass.name=${{ matrix.addon_name }}
+            io.hass.description=${{ matrix.description }}
+            io.hass.arch=${{ matrix.arch }}
+            io.hass.version=${{ matrix.version }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          provenance: false
+          build-args: ${{ steps.args.outputs.build_args }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
