@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.0.4
+- Fix Waze 403 Forbidden: Waze now blocks non-browser TLS fingerprints, so requests impersonate Chrome/Firefox via curl_cffi.
+
 ## 1.0.3
 - Fix Waze 410 Gone: Waze retired the www.waze.com routing endpoints; use the routing-livemap-* hosts.
 
