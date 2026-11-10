@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.3.1
+- All sensors now live under one "Travel Times" MQTT device (one list), named "<Person> to <Place>", instead of one device per person. Existing entities keep their ids and history.
+
 ## 1.3.0
 - Groups: one sensor for 2+ people going to the same place. Choose how it reads: longest (everyone has arrived), shortest, or combined total. Attributes list each person plus total time and distance.
 - Group members are calculated in the background without creating extra sensors, unless you also add them as normal routes.
