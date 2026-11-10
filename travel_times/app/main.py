@@ -79,6 +79,9 @@ DEFAULT_SETTINGS = {
     "max_requests_per_min": 20,  # hard cap on Waze calls, all pairs combined
     "avoid_tolls": False,
     "ai_task_entity": "",        # ai_task.* entity used for place search
+    "backup_dir": os.path.join(DATA, "backups"),
+    "backup_auto": "off",        # off | daily | weekly
+    "backup_keep": 10,           # how many backup files to keep in the folder
 }
 
 COORD_RE = re.compile(r"^\s*(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*$")
@@ -476,7 +479,81 @@ def worker():
             tick()
         except Exception:
             log.exception("tick crashed")
+        try:
+            maybe_auto_backup()
+        except Exception:
+            log.exception("backup check crashed")
         time.sleep(LOOP_SECONDS)
+
+
+# ------------------------------------------------------------------ backups
+STATE_FILE = os.path.join(DATA, "backup_state.json")
+BACKUP_RE = re.compile(r"^travel_times_backup_[A-Za-z0-9_\-]+\.json$")
+ROOT_LABELS = {DATA: "Add-on storage", "/share": "Share", "/media": "Media", "/config": "HA config"}
+
+
+def backup_roots():
+    return [os.path.realpath(r) for r in (DATA, "/share", "/media", "/config") if os.path.isdir(r)]
+
+
+def safe_dir(path):
+    """Real path if it is inside a folder this add-on may use, else None."""
+    if not path:
+        return None
+    real = os.path.realpath(str(path))
+    for r in backup_roots():
+        if real == r or real.startswith(r + os.sep):
+            return real
+    return None
+
+
+def list_backups(d):
+    out = []
+    try:
+        for e in os.scandir(d):
+            if e.is_file() and BACKUP_RE.match(e.name):
+                st = e.stat()
+                out.append({"name": e.name, "size": st.st_size, "mtime": st.st_mtime})
+    except OSError:
+        pass
+    return sorted(out, key=lambda x: -x["mtime"])
+
+
+def make_backup(d, keep, why="manual"):
+    real = safe_dir(d)
+    if not real:
+        raise RuntimeError("That folder is not allowed")
+    os.makedirs(real, exist_ok=True)
+    with lock:
+        c = json.loads(json.dumps(cfg))
+    now = datetime.now().astimezone()
+    name = f"travel_times_backup_{now.strftime('%Y%m%d_%H%M%S')}.json"
+    save_json(os.path.join(real, name), {"app": "travel_times", "created": now.isoformat(timespec="seconds"),
+                                         "reason": why, "config": c})
+    for old in list_backups(real)[max(1, int(keep)):]:
+        try:
+            os.remove(os.path.join(real, old["name"]))
+        except OSError:
+            pass
+    return name
+
+
+def maybe_auto_backup():
+    with lock:
+        s = dict(cfg.get("settings", {}))
+    every = {"daily": 86400, "weekly": 604800}.get(s.get("backup_auto"))
+    if not every:
+        return
+    st = load_json(STATE_FILE, {})
+    if time.time() - st.get("last", 0) < every:
+        return
+    try:
+        name = make_backup(s["backup_dir"], s["backup_keep"], "auto")
+        save_json(STATE_FILE, {"last": time.time()})
+        log.info("Automatic backup written: %s", name)
+    except Exception as e:
+        save_json(STATE_FILE, {"last": time.time() - every + 3600})  # retry in an hour
+        log.warning("Automatic backup failed: %s", e)
 
 
 # ----------------------------------------------------------------- config API
@@ -536,6 +613,9 @@ def clean_cfg(body):
     s["avoid_tolls"] = bool(b.get("avoid_tolls"))
     ai = str(b.get("ai_task_entity") or "").strip()
     s["ai_task_entity"] = ai if ENTITY_RE.match(ai) and ai.startswith("ai_task.") else ""
+    s["backup_dir"] = safe_dir(str(b.get("backup_dir") or "").strip()) or DEFAULT_SETTINGS["backup_dir"]
+    s["backup_auto"] = b.get("backup_auto") if b.get("backup_auto") in ("off", "daily", "weekly") else "off"
+    s["backup_keep"] = clamp(b.get("backup_keep"), 1, 100, 10)
     return {"people": people, "destinations": dests, "routes": routes, "settings": s}
 
 
@@ -655,7 +735,9 @@ def api_get():
     trackers, zones, ais = list_entities()
     with lock:
         c = json.loads(json.dumps(cfg))
-    return jsonify(config=c, status=status_public(), trackers=trackers, zones=zones, ai_tasks=ais)
+    mq_host = (OPTIONS.get("mqtt_host") or "").strip()
+    info = {"mqtt": mq_host or "Mosquitto (automatic)", "log_level": str(OPTIONS.get("log_level", "info"))}
+    return jsonify(config=c, status=status_public(), trackers=trackers, zones=zones, ai_tasks=ais, info=info)
 
 
 @app.get("/api/status")
@@ -684,6 +766,106 @@ def api_search():
         return jsonify(error=str(e)[:300]), 502
 
 
+@app.get("/api/browse")
+def api_browse():
+    path = request.args.get("path", "")
+    real = safe_dir(path)
+    while real and not os.path.isdir(real):  # default folder may not exist yet: show nearest parent
+        real = safe_dir(os.path.dirname(real))
+    if not real:
+        return jsonify(path=None, parent=None, dirs=[
+            {"name": ROOT_LABELS.get(r, r), "path": r} for r in backup_roots()])
+    dirs = []
+    try:
+        for e in sorted(os.scandir(real), key=lambda e: e.name.lower()):
+            if e.is_dir(follow_symlinks=False) and not e.name.startswith("."):
+                dirs.append({"name": e.name, "path": e.path})
+    except OSError as e:
+        return jsonify(error=str(e)), 400
+    parent = "" if real in backup_roots() else os.path.dirname(real)
+    return jsonify(path=real, parent=parent, dirs=dirs)
+
+
+@app.post("/api/mkdir")
+def api_mkdir():
+    b = request.get_json(force=True, silent=True) or {}
+    real = safe_dir(b.get("path"))
+    name = re.sub(r"[^\w\- .]", "", str(b.get("name", ""))).strip()[:60]
+    if not real or not name or name.startswith("."):
+        return jsonify(error="Pick a folder and type a simple name"), 400
+    try:
+        os.makedirs(os.path.join(real, name), exist_ok=True)
+    except OSError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(ok=True, path=os.path.join(real, name))
+
+
+def backup_dir_now():
+    with lock:
+        return cfg["settings"]["backup_dir"], cfg["settings"]["backup_keep"]
+
+
+@app.get("/api/backups")
+def api_backups():
+    d, keep = backup_dir_now()
+    return jsonify(dir=d, files=list_backups(safe_dir(d) or d))
+
+
+@app.post("/api/backup")
+def api_backup():
+    d, keep = backup_dir_now()
+    try:
+        name = make_backup(d, keep)
+    except Exception as e:
+        return jsonify(error=str(e)[:200]), 400
+    return jsonify(ok=True, name=name)
+
+
+def backup_path(name):
+    d, _ = backup_dir_now()
+    real = safe_dir(d)
+    if not real or not BACKUP_RE.match(str(name or "")):
+        return None
+    p = os.path.join(real, name)
+    return p if os.path.isfile(p) else None
+
+
+@app.post("/api/backup/restore")
+def api_restore():
+    p = backup_path((request.get_json(force=True, silent=True) or {}).get("name"))
+    if not p:
+        return jsonify(error="Backup not found"), 404
+    data = load_json(p, {})
+    if not isinstance(data.get("config"), dict):
+        return jsonify(error="That file is not a Travel Times backup"), 400
+    new = clean_cfg(data["config"])
+    with lock:
+        keep = {k: cfg["settings"][k] for k in ("backup_dir", "backup_auto", "backup_keep")}
+    new["settings"].update(keep)
+    apply_cfg(new)
+    return jsonify(ok=True, people=len(new["people"]), places=len(new["destinations"]), routes=len(new["routes"]))
+
+
+@app.post("/api/backup/delete")
+def api_backup_delete():
+    p = backup_path((request.get_json(force=True, silent=True) or {}).get("name"))
+    if not p:
+        return jsonify(error="Backup not found"), 404
+    os.remove(p)
+    return jsonify(ok=True)
+
+
+@app.get("/api/backup/download")
+def api_backup_download():
+    p = backup_path(request.args.get("name"))
+    if not p:
+        return jsonify(error="Backup not found"), 404
+    with open(p, "rb") as f:
+        body = f.read()
+    return Response(body, mimetype="application/json",
+                    headers={"Content-Disposition": f"attachment; filename={os.path.basename(p)}"})
+
+
 @app.post("/api/refresh")
 def api_refresh():
     with lock:
@@ -694,142 +876,192 @@ def api_refresh():
 
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Travel Times</title>
 <style>
-:root{--tx:#e8e8f0;--mu:#8a8aa0;--ac:#03a9f4;--bad:#ff5252;--ok:#4caf50;--line:#2a2a44}
-*{box-sizing:border-box}
-body{margin:0;padding:16px 16px 90px;font:15px system-ui,sans-serif;color:var(--tx);
-background:linear-gradient(160deg,#0d0d0d,#1a1a2e) fixed;min-height:100vh}
-h1{font-size:22px;margin:0}h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--mu);margin:26px 0 8px}
-header{display:flex;justify-content:space-between;align-items:center;gap:10px}
-.card{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:8px}
+:root{--tx:#e8e8f0;--mu:#8a8aa0;--ac:#03a9f4;--bad:#ff5252;--ok:#4caf50;--line:#2a2a44;--card:rgba(255,255,255,.05)}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;font:16px system-ui,sans-serif;color:var(--tx);background:linear-gradient(160deg,#0d0d0d,#1a1a2e) fixed;min-height:100vh}
+.top{position:sticky;top:0;z-index:5;display:flex;justify-content:space-between;align-items:center;padding:12px 16px;background:#0d0d0df2;border-bottom:1px solid var(--line)}
+.top h1{font-size:20px;margin:0}
+main{padding:14px 14px calc(150px + env(safe-area-inset-bottom))}
+.pg.hid,.hid{display:none!important}
+h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--mu);margin:22px 0 8px}
+h2:first-child{margin-top:4px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:10px}
 .live{display:flex;justify-content:space-between;align-items:center;gap:10px}
-.big{font-size:26px;font-weight:700;color:var(--ac);white-space:nowrap}.sub{color:var(--mu);font-size:12px;margin-top:2px}
+.big{font-size:26px;font-weight:700;color:var(--ac);white-space:nowrap}
+.sub{color:var(--mu);font-size:13px;margin-top:2px;word-break:break-word}
 .err{color:var(--bad)}.ok{color:var(--ok)}
-.row{display:grid;grid-template-columns:1fr 1.6fr auto;gap:8px;margin-bottom:8px}
-input,select{width:100%;background:#12121f;color:var(--tx);border:1px solid var(--line);border-radius:10px;padding:10px;font:inherit;min-width:0}
-button{background:#23233a;color:var(--tx);border:1px solid var(--line);border-radius:10px;padding:10px 14px;font:inherit;cursor:pointer}
+input,select{width:100%;min-height:46px;background:#12121f;color:var(--tx);border:1px solid var(--line);border-radius:10px;padding:10px;font:inherit;min-width:0}
+input[type=checkbox]{width:22px;min-height:22px;height:22px}
+button{min-height:44px;background:#23233a;color:var(--tx);border:1px solid var(--line);border-radius:10px;padding:8px 14px;font:inherit;cursor:pointer}
 button.p{background:var(--ac);border-color:var(--ac);color:#04121c;font-weight:700}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{font-size:12px;color:var(--mu);display:block;margin-bottom:4px}
-.chips{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 10px}.chip{display:flex;align-items:center;gap:4px;margin:0;font-size:13px;color:var(--tx)}.chip input{width:auto}
-.hint{font-size:11px;color:var(--mu);margin-top:3px}
-.bar{position:fixed;left:0;right:0;bottom:0;padding:12px 16px;background:#0d0d0dee;border-top:1px solid var(--line);display:flex;gap:12px;align-items:center}
-@media(max-width:560px){.row{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}
+button.d{color:var(--bad)}button.ico{padding:8px 12px;font-size:18px}button:disabled{opacity:.5}
+.stack{display:flex;flex-direction:column;gap:8px}.hrow{display:flex;gap:8px;align-items:center}.hrow>*{flex:1}.hrow>button{flex:0 0 auto}
+.field{margin-bottom:12px}.field:last-child{margin-bottom:0}
+label.l{display:block;font-size:13px;color:var(--mu);margin-bottom:4px}
+.hint{font-size:12px;color:var(--mu);margin-top:4px}
+.seg{display:flex;background:#12121f;border:1px solid var(--line);border-radius:12px;padding:3px;margin-bottom:12px}
+.seg button{flex:1;border:0;background:transparent;min-height:40px}.seg button.on{background:var(--ac);color:#04121c;font-weight:700}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+.chip{display:flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--line);border-radius:20px;font-size:14px}
+.nav{position:fixed;left:0;right:0;bottom:0;z-index:6;display:flex;background:#0d0d0dfa;border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
+.nav button{flex:1;border:0;border-radius:0;background:transparent;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:11px;color:var(--mu);min-height:58px}
+.nav button span{font-size:21px;line-height:1}.nav button.on{color:var(--ac)}
+.savebar{position:fixed;left:12px;right:12px;bottom:calc(68px + env(safe-area-inset-bottom));z-index:7;display:flex;align-items:center;justify-content:space-between;gap:10px;background:#1f2a3a;border:1px solid var(--ac);border-radius:14px;padding:8px 8px 8px 14px}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(130px + env(safe-area-inset-bottom));z-index:9;background:#2b2b45;border:1px solid var(--line);border-radius:20px;padding:10px 16px;max-width:90%}
+.sheet{position:fixed;inset:0;z-index:10;background:#000a;display:none;align-items:flex-end}.sheet.open{display:flex}
+.sheet>div{width:100%;max-height:85vh;overflow:auto;background:#161626;border-radius:18px 18px 0 0;padding:14px 14px calc(14px + env(safe-area-inset-bottom))}
+.item{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:12px 4px;border-bottom:1px solid var(--line);cursor:pointer;word-break:break-word}
+@media(min-width:700px){main{max-width:640px;margin:0 auto}}
 </style></head><body>
-<header><h1>🚗 Travel Times</h1><button onclick="refreshNow()">Refresh now</button></header>
-<h2>Live</h2><div id="live"><div class="sub">Loading…</div></div>
-<h2>People</h2><div id="people"></div><button onclick="addPerson()">+ Person</button>
-<h2>Places</h2><div id="dests"></div><button onclick="addDest()">+ Place</button>
-<div class="hint">A place can be a zone, "lat, lon", or a street address.</div>
-<h2>Find a place (AI)</h2>
-<div class="card">
-<div class="row" style="grid-template-columns:1.6fr 1fr auto"><input id="q" placeholder="e.g. closest Lowe's, Mario's Pizza downtown" onkeydown="if(event.key==='Enter')doSearch()"><select id="near"></select><button onclick="doSearch()">Search</button></div>
-<div class="sub">Also add routes from:</div><div id="sopts" class="chips"></div>
-<div id="sres"></div>
-</div>
-<h2>Routes</h2><div id="routes"></div>
-<button onclick="addRoute()">+ Route</button> <button onclick="fillAll()">Everyone → all places</button>
-<div class="hint">Each route is one sensor. Pick a person as the "To" to track person to person.</div>
-<h2>Settings</h2><div id="settings" class="grid"></div>
+<div class="top"><h1 id="title">Live</h1><button class="ico" onclick="refreshNow()" aria-label="Refresh">⟳</button></div>
+<main>
+<section id="p-live" class="pg"><div id="live"><div class="sub">Loading…</div></div></section>
+<section id="p-setup" class="pg hid">
+ <div class="seg" id="seg"></div>
+ <div id="s-people"></div><div id="s-places" class="hid"></div><div id="s-routes" class="hid"></div>
+</section>
+<section id="p-find" class="pg hid">
+ <div class="card stack">
+  <input id="q" placeholder="e.g. closest Lowe's, Mario's Pizza downtown" enterkeyhint="search" onkeydown="if(event.key==='Enter')doSearch()">
+  <select id="near"></select>
+  <div><div class="sub">Also add routes from:</div><div id="sopts" class="chips"></div></div>
+  <button class="p" onclick="doSearch()">Search</button>
+ </div>
+ <div id="sres"></div>
+</section>
+<section id="p-settings" class="pg hid"><div id="settings"></div></section>
+<section id="p-backup" class="pg hid"><div id="backup"></div></section>
+</main>
 <datalist id="dl"></datalist>
-<div class="bar"><button class="p" onclick="save()">Save</button><span id="msg" class="sub"></span></div>
+<div id="savebar" class="savebar hid"><span>Unsaved changes</span><button class="p" onclick="save()">Save</button></div>
+<div id="toast" class="toast hid"></div>
+<nav class="nav" id="nav"></nav>
+<div id="sheet" class="sheet" onclick="if(event.target===this)closeSheet()"><div id="sheetbody"></div></div>
 <script>
-let S=null,SR=[];const OFF=new Set();const $=s=>document.querySelector(s);
+let S=null,SR=[],BR=null,BK=null,page='live',sub='people',dirty=false;
+const OFF=new Set();const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const rid=()=>{const a=new Uint8Array(4);if(window.crypto&&crypto.getRandomValues)crypto.getRandomValues(a);else a.forEach((_,i)=>a[i]=Math.random()*256);return Array.from(a,b=>b.toString(16).padStart(2,'0')).join('')};
 const nameOf=id=>{const p=S.config.people.find(x=>x.id===id);if(p)return p.name||'(unnamed)';const d=S.config.destinations.find(x=>x.id===id);return d?(d.name||'(unnamed)'):'?'};
-const FIELDS=[
- ['region','Waze region','select',['US','EU','AU','IL'],'US covers North America'],
- ['units','Units','select',['imperial','metric'],'Distance attribute only. Time is always minutes'],
- ['moving_interval','Moving: update every (sec)','number',0,'Min 20. This is your "real-time" speed'],
- ['idle_interval','Parked: update every (sec)','number',0,'Used when they are not going anywhere'],
- ['move_threshold_m','Counts as moving after (m)','number',0,'Distance moved since last calc'],
- ['arrival_radius_m','Arrived within (m)','number',0,'Inside this = 0 min, no Waze call'],
- ['max_requests_per_min','Max Waze calls / min','number',0,'Safety cap for all routes combined'],
- ['avoid_tolls','Avoid toll roads','check',0,'']];
+const J=(url,body)=>fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(r=>r.json());
+function toast(t,ms=2600){const e=$('#toast');e.textContent=t;e.classList.remove('hid');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.add('hid'),ms)}
+function touch(){dirty=true;$('#savebar').classList.remove('hid')}
+const PAGES=[['live','🏠','Live'],['setup','🧭','Setup'],['find','🔎','Find'],['settings','⚙️','Settings'],['backup','💾','Backup']];
+$('#nav').innerHTML=PAGES.map(([k,i,l])=>`<button id="n-${k}" onclick="go('${k}')"><span>${i}</span>${l}</button>`).join('');
+function go(k){
+  page=k;try{sessionStorage.setItem('tt_page',k)}catch(e){}
+  PAGES.forEach(([x,,l])=>{$('#p-'+x).classList.toggle('hid',x!==k);$('#n-'+x).classList.toggle('on',x===k);if(x===k)$('#title').textContent=l});
+  if(k==='backup')loadBackups();window.scrollTo(0,0);
+}
 async function load(){
   const r=await fetch('api/config');S=await r.json();S.config.routes=S.config.routes||[];
   $('#dl').innerHTML=[...S.zones,...S.trackers].map(o=>`<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
-  renderAll();
+  dirty=false;$('#savebar').classList.add('hid');renderAll();
 }
-function renderAll(){renderPeople();renderDests();renderRoutes();renderSearchOpts();renderSettings();renderLive(S.status)}
+function renderAll(){renderSeg();renderPeople();renderDests();renderRoutes();renderSearchOpts();renderSettings();renderBackup();renderLive(S.status)}
 function dropRoutes(id){S.config.routes=S.config.routes.filter(r=>r.from!==id&&r.to!==id)}
+function renderSeg(){
+  const C=S.config,t=[['people','People',C.people.length],['places','Places',C.destinations.length],['routes','Routes',C.routes.length]];
+  $('#seg').innerHTML=t.map(([k,l,n])=>`<button class="${sub===k?'on':''}" onclick="setSub('${k}')">${l} (${n})</button>`).join('');
+  t.forEach(([k])=>$('#s-'+k).classList.toggle('hid',k!==sub));
+}
+function setSub(k){sub=k;renderSeg()}
+function card(){const c=document.createElement('div');c.className='card stack';return c}
 function renderPeople(){
-  const el=$('#people');el.innerHTML='';
+  const el=$('#s-people');el.innerHTML='';
   S.config.people.forEach((p,i)=>{
-    const row=document.createElement('div');row.className='row';
-    const nm=document.createElement('input');nm.placeholder='Name (Jon)';nm.value=p.name||'';nm.oninput=()=>{p.name=nm.value;renderRoutes();renderLive(S.status)};
+    const c=card();
+    const nm=document.createElement('input');nm.placeholder='Name (Jon)';nm.value=p.name||'';nm.oninput=()=>{p.name=nm.value;touch();renderRoutes();renderLive(S.status);renderSearchOpts()};
     const sel=document.createElement('select');
     const opts=[...S.trackers];if(p.entity&&!opts.find(o=>o.id===p.entity))opts.unshift({id:p.entity,name:p.entity});
     sel.innerHTML='<option value="">Pick a location source…</option>'+opts.map(o=>`<option value="${esc(o.id)}">${esc(o.name)} (${esc(o.id)})</option>`).join('');
-    sel.value=p.entity||'';sel.onchange=()=>{p.entity=sel.value;renderSearchOpts()};
-    const rm=document.createElement('button');rm.textContent='✕';rm.onclick=()=>{dropRoutes(p.id);S.config.people.splice(i,1);renderAll()};
-    row.append(nm,sel,rm);el.append(row);
+    sel.value=p.entity||'';sel.onchange=()=>{p.entity=sel.value;touch();renderSearchOpts()};
+    const rm=document.createElement('button');rm.className='d';rm.textContent='Remove person';rm.onclick=()=>{dropRoutes(p.id);S.config.people.splice(i,1);touch();renderAll()};
+    c.append(nm,sel,rm);el.append(c);
   });
+  const add=document.createElement('button');add.className='p';add.textContent='+ Add person';add.onclick=()=>{S.config.people.push({id:rid(),name:'',entity:''});touch();renderAll()};
+  el.append(add);
 }
 function renderDests(){
-  const el=$('#dests');el.innerHTML='';
+  const el=$('#s-places');el.innerHTML='';
   S.config.destinations.forEach((d,i)=>{
-    const row=document.createElement('div');row.className='row';
-    const nm=document.createElement('input');nm.placeholder='Name (Work)';nm.value=d.name||'';nm.oninput=()=>{d.name=nm.value;renderRoutes();renderLive(S.status)};
-    const tg=document.createElement('input');tg.placeholder='zone.work, 34.5,-82.6, or address';tg.setAttribute('list','dl');tg.value=d.target||'';tg.oninput=()=>d.target=tg.value;
-    const rm=document.createElement('button');rm.textContent='✕';rm.onclick=()=>{dropRoutes(d.id);S.config.destinations.splice(i,1);renderAll()};
-    row.append(nm,tg,rm);el.append(row);
+    const c=card();
+    const nm=document.createElement('input');nm.placeholder='Name (Work)';nm.value=d.name||'';nm.oninput=()=>{d.name=nm.value;touch();renderRoutes();renderLive(S.status)};
+    const tg=document.createElement('input');tg.placeholder='zone.work, 34.5,-82.6, or address';tg.setAttribute('list','dl');tg.value=d.target||'';tg.oninput=()=>{d.target=tg.value;touch()};
+    const rm=document.createElement('button');rm.className='d';rm.textContent='Remove place';rm.onclick=()=>{dropRoutes(d.id);S.config.destinations.splice(i,1);touch();renderAll()};
+    c.append(nm,tg,rm);el.append(c);
   });
+  const add=document.createElement('button');add.className='p';add.textContent='+ Add place';add.onclick=()=>{S.config.destinations.push({id:rid(),name:'',target:''});touch();renderAll()};
+  el.append(add);el.insertAdjacentHTML('beforeend','<div class="hint">A place can be a zone, "lat, lon", or a street address. Use the Find tab to search with AI.</div>');
 }
 function renderRoutes(){
-  const el=$('#routes');el.innerHTML='';
+  const el=$('#s-routes');el.innerHTML='';
   const P=S.config.people,D=S.config.destinations;
   const po=P.map(p=>`<option value="${esc(p.id)}">${esc(p.name||'(unnamed)')}</option>`).join('');
   const dopt=D.map(d=>`<option value="${esc(d.id)}">${esc(d.name||'(unnamed)')}</option>`).join('');
   S.config.routes.forEach((r,i)=>{
-    const row=document.createElement('div');row.className='row';row.style.gridTemplateColumns='1fr 1fr auto';
-    const f=document.createElement('select');f.innerHTML='<option value="">From…</option>'+po;f.value=r.from||'';f.onchange=()=>{r.from=f.value;renderLive(S.status)};
+    const c=card();
+    const f=document.createElement('select');f.innerHTML='<option value="">From…</option>'+po;f.value=r.from||'';f.onchange=()=>{r.from=f.value;touch();renderLive(S.status)};
     const t=document.createElement('select');
     t.innerHTML='<option value="">To…</option>'+(D.length?`<optgroup label="Places">${dopt}</optgroup>`:'')+(P.length?`<optgroup label="People (live)">${po}</optgroup>`:'');
-    t.value=r.to||'';t.onchange=()=>{r.to=t.value;renderLive(S.status)};
-    const rm=document.createElement('button');rm.textContent='✕';rm.onclick=()=>{S.config.routes.splice(i,1);renderRoutes();renderLive(S.status)};
-    row.append(f,t,rm);el.append(row);
+    t.value=r.to||'';t.onchange=()=>{r.to=t.value;touch();renderLive(S.status)};
+    const rm=document.createElement('button');rm.className='d';rm.textContent='Remove route';rm.onclick=()=>{S.config.routes.splice(i,1);touch();renderRoutes();renderSeg();renderLive(S.status)};
+    c.append(f,t,rm);el.append(c);
   });
+  const add=document.createElement('button');add.className='p';add.textContent='+ Add route';add.onclick=()=>{S.config.routes.push({from:'',to:''});touch();renderRoutes();renderSeg()};
+  const fill=document.createElement('button');fill.textContent='Everyone → all places';fill.onclick=fillAll;
+  const w=document.createElement('div');w.className='stack';w.append(add,fill);el.append(w);
+  el.insertAdjacentHTML('beforeend','<div class="hint">Each route is one sensor. Pick a person as the "To" to track person to person.</div>');
 }
-function addRoute(){S.config.routes.push({from:'',to:''});renderRoutes()}
 function fillAll(){
   for(const p of S.config.people)for(const d of S.config.destinations)
     if(!S.config.routes.some(r=>r.from===p.id&&r.to===d.id))S.config.routes.push({from:p.id,to:d.id});
-  renderRoutes();renderLive(S.status);
+  touch();renderRoutes();renderSeg();renderLive(S.status);
 }
+function field(label,ctrl,hint){
+  const w=document.createElement('div');w.className='field';w.innerHTML=`<label class="l">${label}</label>`;w.append(ctrl);
+  if(hint)w.insertAdjacentHTML('beforeend',`<div class="hint">${hint}</div>`);return w;
+}
+function selCtl(opts,val,on){const s=document.createElement('select');s.innerHTML=opts.map(o=>Array.isArray(o)?`<option value="${esc(o[0])}">${esc(o[1])}</option>`:`<option>${esc(o)}</option>`).join('');s.value=val;s.onchange=()=>on(s.value);return s}
+function numCtl(val,on){const i=document.createElement('input');i.type='number';i.inputMode='numeric';i.value=val;i.oninput=()=>on(i.value);return i}
+function group(title,fields){const c=document.createElement('div');c.className='card';c.insertAdjacentHTML('beforeend',`<h2 style="margin-top:0">${title}</h2>`);fields.forEach(f=>c.append(f));return c}
 function renderSettings(){
   const el=$('#settings');el.innerHTML='';const s=S.config.settings;
-  FIELDS.forEach(([k,l,t,o,h])=>{
-    const w=document.createElement('div');let inp;
-    if(t==='select'){inp=document.createElement('select');inp.innerHTML=o.map(x=>`<option>${x}</option>`).join('');inp.value=s[k];inp.onchange=()=>s[k]=inp.value}
-    else if(t==='check'){inp=document.createElement('input');inp.type='checkbox';inp.style.width='auto';inp.checked=!!s[k];inp.onchange=()=>s[k]=inp.checked}
-    else{inp=document.createElement('input');inp.type='number';inp.value=s[k];inp.oninput=()=>s[k]=inp.value}
-    w.innerHTML=`<label>${l}</label>`;w.append(inp);if(h)w.insertAdjacentHTML('beforeend',`<div class="hint">${h}</div>`);el.append(w);
-  });
-  const w=document.createElement('div');w.style.gridColumn='1/-1';w.innerHTML='<label>AI Task entity (for place search)</label>';
-  let inp;
+  const set=k=>v=>{s[k]=v;touch()};
+  const chk=document.createElement('input');chk.type='checkbox';chk.checked=!!s.avoid_tolls;chk.onchange=()=>{s.avoid_tolls=chk.checked;touch()};
+  el.append(group('Waze',[
+    field('Region',selCtl(['US','EU','AU','IL'],s.region,set('region')),'US covers North America'),
+    field('Distance units',selCtl([['imperial','Miles'],['metric','Kilometers']],s.units,set('units')),'Only affects the distance attribute. Time is always minutes'),
+    field('Avoid toll roads',chk)]));
+  el.append(group('Update speed',[
+    field('While moving: update every (sec)',numCtl(s.moving_interval,set('moving_interval')),'Minimum 20. This is your "real-time" speed'),
+    field('While parked: update every (sec)',numCtl(s.idle_interval,set('idle_interval')),'Used when nobody is going anywhere'),
+    field('Counts as moving after (m)',numCtl(s.move_threshold_m,set('move_threshold_m')),'Distance moved since the last calculation')]));
+  el.append(group('Arrival & limits',[
+    field('Arrived within (m)',numCtl(s.arrival_radius_m,set('arrival_radius_m')),'Inside this the sensor is 0 and no Waze call is made'),
+    field('Max Waze calls per minute',numCtl(s.max_requests_per_min,set('max_requests_per_min')),'Safety cap for all routes combined')]));
+  let ai;
   if(S.ai_tasks.length){
-    inp=document.createElement('select');
     const opts=[...S.ai_tasks];if(s.ai_task_entity&&!opts.find(o=>o.id===s.ai_task_entity))opts.unshift({id:s.ai_task_entity,name:s.ai_task_entity});
-    inp.innerHTML='<option value="">None (place search off)</option>'+opts.map(o=>`<option value="${esc(o.id)}">${esc(o.name)} (${esc(o.id)})</option>`).join('');
-    inp.value=s.ai_task_entity||'';inp.onchange=()=>s.ai_task_entity=inp.value;
-    w.append(inp);
-  }else{
-    inp=document.createElement('input');inp.placeholder='ai_task.your_entity';inp.value=s.ai_task_entity||'';inp.oninput=()=>s.ai_task_entity=inp.value.trim();
-    w.append(inp);w.insertAdjacentHTML('beforeend','<div class="hint">No ai_task entities found in Home Assistant. Add an AI Task provider (Google, OpenAI, Ollama…) or type the entity id.</div>');
-  }
-  el.append(w);
+    ai=selCtl([['','None (place search off)'],...opts.map(o=>[o.id,`${o.name} (${o.id})`])],s.ai_task_entity||'',set('ai_task_entity'));
+  }else{ai=document.createElement('input');ai.placeholder='ai_task.your_entity';ai.value=s.ai_task_entity||'';ai.oninput=()=>{s.ai_task_entity=ai.value.trim();touch()}}
+  el.append(group('AI place search',[field('AI Task entity',ai,S.ai_tasks.length?'Used by the Find tab':'No ai_task entities found. Add an AI Task provider (Google, OpenAI, Ollama…) or type the entity id')]));
+  const inf=document.createElement('div');inf.className='card';
+  inf.innerHTML=`<h2 style="margin-top:0">Connection</h2><div class="sub">MQTT broker: ${esc(S.info.mqtt)}<br>Log level: ${esc(S.info.log_level)}</div><div class="hint">Change these on the add-on's Configuration tab, then restart the add-on.</div>`;
+  el.append(inf);
 }
 function renderSearchOpts(){
-  $('#near').innerHTML='<option value="home">Near Home</option>'+S.config.people.filter(p=>p.entity).map(p=>`<option value="${esc(p.id)}">Near ${esc(p.name||p.entity)} now</option>`).join('');
+  $('#near').innerHTML='<option value="home">Near Home</option>'+S.config.people.filter(p=>p.entity).map(p=>`<option value="${esc(p.id)}">Near ${esc(p.name||p.entity)} right now</option>`).join('');
   const el=$('#sopts');el.innerHTML='';
   S.config.people.forEach(p=>{
     const l=document.createElement('label');l.className='chip';
     const c=document.createElement('input');c.type='checkbox';c.checked=!OFF.has(p.id);c.onchange=()=>{c.checked?OFF.delete(p.id):OFF.add(p.id)};
-    l.append(c,' '+(p.name||'(unnamed)'));el.append(l);
+    l.append(c,p.name||'(unnamed)');el.append(l);
   });
+  if(!S.config.people.length)el.innerHTML='<span class="sub">Add people in Setup first</span>';
 }
 function dist(m){if(m==null)return'';const u=S.config.settings.units==='metric';return ' · '+(m/(u?1000:1609.344)).toFixed(1)+(u?' km':' mi')+' away'}
 async function doSearch(){
@@ -839,8 +1071,7 @@ async function doSearch(){
   out.innerHTML='<div class="sub">Searching… this can take up to a minute</div>';
   const p=S.config.people.find(x=>x.id===$('#near').value);
   try{
-    const r=await fetch('api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q,entity:ent,near:p?p.entity:'home'})});
-    const j=await r.json();
+    const j=await J('api/search',{query:q,entity:ent,near:p?p.entity:'home'});
     if(j.error){out.innerHTML=`<div class="sub err">${esc(j.error)}</div>`;return}
     SR=j.results;out.innerHTML='';
     SR.forEach((x,i)=>{
@@ -855,32 +1086,83 @@ function addResult(i,btn){
   const x=SR[i],id=rid();
   S.config.destinations.push({id,name:x.name.slice(0,40),target:`${x.lat}, ${x.lon}`});
   S.config.people.forEach(p=>{if(p.id&&!OFF.has(p.id))S.config.routes.push({from:p.id,to:id})});
-  btn.textContent='Added ✓';btn.disabled=true;
-  renderDests();renderRoutes();renderLive(S.status);$('#msg').textContent='Added. Press Save to start tracking.';
+  btn.textContent='Added ✓';btn.disabled=true;touch();renderDests();renderRoutes();renderSeg();renderLive(S.status);toast('Added. Press Save to start tracking.');
 }
 function ago(t){if(!t)return'never';const s=Math.round(Date.now()/1000-t);return s<90?s+'s ago':Math.round(s/60)+'m ago'}
 function renderLive(st){
-  const out=[];
-  for(const r of S.config.routes){
-    if(!r.from||!r.to||r.from===r.to)continue;
-    const x=st[r.from+'|'+r.to]||{};let big='…',sub='waiting for first calculation';
-    if(x.minutes!=null){big=x.arrived?'Here':Math.round(x.minutes)+' min';
-      sub=(x.arrived?'arrived':`${x.distance} ${x.unit}${x.via?' via '+esc(x.via):''}`)+' · '+ago(x.t)}
-    if(x.error)sub=`<span class="err">${esc(x.error)}</span>`+(x.minutes!=null?' · last good '+ago(x.t):'');
-    out.push(`<div class="card live"><div><b>${esc(nameOf(r.from))} → ${esc(nameOf(r.to))}</b><div class="sub">${sub}</div></div><div class="big">${big}</div></div>`);
+  const by={};
+  for(const r of S.config.routes){if(r.from&&r.to&&r.from!==r.to)(by[r.from]=by[r.from]||[]).push(r)}
+  let out='';
+  for(const p of S.config.people){
+    if(!by[p.id])continue;out+=`<h2>${esc(p.name||'(unnamed)')}</h2>`;
+    for(const r of by[p.id]){
+      const x=st[r.from+'|'+r.to]||{};let big='…',sb='waiting for first calculation';
+      if(x.minutes!=null){big=x.arrived?'Here':Math.round(x.minutes)+' min';
+        sb=(x.arrived?'arrived':`${x.distance} ${x.unit}${x.via?' via '+esc(x.via):''}`)+' · '+ago(x.t)}
+      if(x.error)sb=`<span class="err">${esc(x.error)}</span>`+(x.minutes!=null?' · last good '+ago(x.t):'');
+      out+=`<div class="card live"><div><b>→ ${esc(nameOf(r.to))}</b><div class="sub">${sb}</div></div><div class="big">${big}</div></div>`;
+    }
   }
-  $('#live').innerHTML=out.join('')||'<div class="sub">Add people and places, add a route, hit Save.</div>';
+  $('#live').innerHTML=out||'<div class="card"><div class="sub">Nothing to show yet. Open <b>Setup</b> to add people, places and routes, then Save.</div></div>';
 }
-function addPerson(){S.config.people.push({id:rid(),name:'',entity:''});renderPeople();renderRoutes();renderSearchOpts()}
-function addDest(){S.config.destinations.push({id:rid(),name:'',target:''});renderDests();renderRoutes()}
 async function save(){
-  $('#msg').textContent='Saving…';
-  await fetch('api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(S.config)});
-  await load();$('#msg').innerHTML='<span class="ok">Saved ✓</span>';setTimeout(()=>$('#msg').textContent='',2500);
+  const r=await J('api/config',S.config);
+  const keep=page;await load();go(keep);toast('Saved ✓');
 }
-async function refreshNow(){await fetch('api/refresh',{method:'POST'});$('#msg').textContent='Recalculating…'}
+async function refreshNow(){await J('api/refresh');toast('Recalculating…')}
+/* ---------- backups ---------- */
+const RL={'/data':'Add-on storage','/share':'Share','/media':'Media','/config':'HA config'};
+async function loadBackups(){try{BK=await (await fetch('api/backups')).json()}catch(e){BK=null}renderBackup()}
+function fmtDate(t){return new Date(t*1000).toLocaleString([], {dateStyle:'medium',timeStyle:'short'})}
+function renderBackup(){
+  const el=$('#backup');if(!S)return;el.innerHTML='';const s=S.config.settings;
+  const c1=document.createElement('div');c1.className='card stack';
+  c1.innerHTML=`<h2 style="margin:0">Backup folder</h2><div style="word-break:break-all">${esc(s.backup_dir)}</div><div class="hint">Saves your people, places, routes and settings. Folders under Share, Media or HA config are easy to reach from other tools. The default is inside the add-on and is part of normal Home Assistant backups.</div>`;
+  const ch=document.createElement('button');ch.textContent='Choose folder…';ch.onclick=openPicker;c1.append(ch);el.append(c1);
+  const c2=document.createElement('div');c2.className='card';c2.insertAdjacentHTML('beforeend','<h2 style="margin-top:0">Automatic backups</h2>');
+  c2.append(field('Schedule',selCtl([['off','Off'],['daily','Every day'],['weekly','Every week']],s.backup_auto,v=>{s.backup_auto=v;touch()})),
+    field('Keep the newest (files)',numCtl(s.backup_keep,v=>{s.backup_keep=v;touch()}),'Older backups in this folder are deleted'));
+  el.append(c2);
+  const now=document.createElement('button');now.className='p';now.textContent='Back up now';now.style.width='100%';now.style.marginBottom='12px';
+  now.onclick=async()=>{if(dirty){await save();go('backup')}const j=await J('api/backup');j.error?toast(j.error,4000):toast('Backup saved: '+j.name,3500);loadBackups()};
+  el.append(now);
+  const c3=document.createElement('div');c3.insertAdjacentHTML('beforeend','<h2>Backups in this folder</h2>');
+  const files=(BK&&BK.files)||[];
+  if(!files.length)c3.insertAdjacentHTML('beforeend','<div class="card"><div class="sub">No backups yet.</div></div>');
+  files.forEach(f=>{
+    const c=document.createElement('div');c.className='card stack';
+    c.innerHTML=`<div><b>${esc(fmtDate(f.mtime))}</b><div class="sub">${esc(f.name)} · ${(f.size/1024).toFixed(1)} KB</div></div>`;
+    const h=document.createElement('div');h.className='hrow';
+    const rs=document.createElement('button');rs.textContent='Restore';rs.onclick=async()=>{if(!confirm('Replace your current people, places, routes and settings with this backup?'))return;const j=await J('api/backup/restore',{name:f.name});if(j.error){toast(j.error,4000);return}await load();go('backup');toast(`Restored ${j.routes} routes`)};
+    const dl=document.createElement('a');dl.href='api/backup/download?name='+encodeURIComponent(f.name);dl.textContent='Download';dl.style.cssText='display:flex;align-items:center;justify-content:center;min-height:44px;border:1px solid var(--line);border-radius:10px;color:var(--tx);text-decoration:none;background:#23233a;padding:0 14px';
+    const del=document.createElement('button');del.className='d';del.textContent='Delete';del.onclick=async()=>{if(!confirm('Delete this backup file?'))return;await J('api/backup/delete',{name:f.name});loadBackups()};
+    h.append(rs,dl,del);c.append(h);c3.append(c);
+  });
+  el.append(c3);
+}
+/* ---------- folder picker ---------- */
+function closeSheet(){$('#sheet').classList.remove('open')}
+async function openPicker(){$('#sheet').classList.add('open');await browse(S.config.settings.backup_dir||'')}
+async function browse(p){BR=await (await fetch('api/browse?path='+encodeURIComponent(p))).json();renderSheet()}
+function renderSheet(){
+  const b=$('#sheetbody');b.innerHTML='';
+  const hd=document.createElement('div');hd.innerHTML=`<h2 style="margin:0 0 4px">Choose a folder</h2><div class="sub" style="margin-bottom:8px;word-break:break-all">${BR.path?esc(BR.path):'Pick a location'}</div>`;b.append(hd);
+  const add=(label,path)=>{const it=document.createElement('div');it.className='item';it.innerHTML=`<span>${label}</span><span class="sub">›</span>`;it.onclick=()=>browse(path);b.append(it)};
+  if(BR.path!==null)add('⬆️ Up',BR.parent);
+  (BR.dirs||[]).forEach(d=>add(`📁 ${esc(d.name)}`,d.path));
+  if(BR.path!==null&&!(BR.dirs||[]).length){b.insertAdjacentHTML('beforeend','<div class="sub" style="padding:10px 4px">No subfolders here.</div>')}
+  if(BR.path!==null){
+    const nf=document.createElement('div');nf.className='hrow';nf.style.margin='12px 0 8px';
+    const ni=document.createElement('input');ni.placeholder='New folder name';
+    const nb=document.createElement('button');nb.textContent='Create';nb.onclick=async()=>{const j=await J('api/mkdir',{path:BR.path,name:ni.value});if(j.error){toast(j.error,3500);return}browse(j.path)};
+    nf.append(ni,nb);b.append(nf);
+    const use=document.createElement('button');use.className='p';use.style.width='100%';use.textContent='Use this folder';
+    use.onclick=async()=>{S.config.settings.backup_dir=BR.path;closeSheet();await save();go('backup')};b.append(use);
+  }
+  const cl=document.createElement('button');cl.textContent='Cancel';cl.style.cssText='width:100%;margin-top:8px';cl.onclick=closeSheet;b.append(cl);
+}
 setInterval(async()=>{if(!S)return;try{const r=await fetch('api/status');S.status=await r.json();renderLive(S.status)}catch(e){}},5000);
-load();
+load().then(()=>{let k='live';try{k=sessionStorage.getItem('tt_page')||'live'}catch(e){}go(PAGES.some(x=>x[0]===k)?k:'live')});
 </script></body></html>"""
 
 
