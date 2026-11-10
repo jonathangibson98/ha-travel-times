@@ -35,6 +35,9 @@ HDR = {"Authorization": f"Bearer {TOKEN}"}
 BASE = "travel_times"
 STATUS_TOPIC = f"{BASE}/status"
 LOOP_SECONDS = 5
+# every sensor (people routes and groups) lives under this one MQTT device
+DEVICE = {"identifiers": [BASE], "name": "Travel Times", "manufacturer": "Travel Times add-on",
+          "model": "Waze travel time"}
 
 
 def load_json(path, default):
@@ -323,7 +326,7 @@ def publish_group_discovery(g, ends):
     if not d:
         return
     payload = {
-        "name": f"To {d['name']}",
+        "name": f"{g['name']} to {d['name']}",
         "unique_id": f"{BASE}_group_{g['id']}",
         "default_entity_id": f"sensor.{slug(g['name'])}_to_{slug(d['name'])}",
         "state_topic": f"{BASE}/group/{g['id']}/state",
@@ -333,8 +336,7 @@ def publish_group_discovery(g, ends):
         "device_class": "duration",
         "state_class": "measurement",
         "icon": "mdi:account-group",
-        "device": {"identifiers": [f"{BASE}_group_{g['id']}"], "name": f"{g['name']} Travel Times",
-                   "manufacturer": "Travel Times add-on", "model": "Group travel time"},
+        "device": DEVICE,
     }
     pub(group_disc_topic(g["id"]), json.dumps(payload))
 
@@ -404,7 +406,7 @@ def disc_topic(pid, did):
 
 def publish_discovery(p, d):
     payload = {
-        "name": f"To {d['name']}",
+        "name": f"{p['name']} to {d['name']}",
         "unique_id": f"{BASE}_{p['id']}_{d['id']}",
         "default_entity_id": f"sensor.{slug(p['name'])}_to_{slug(d['name'])}",
         "state_topic": f"{BASE}/{p['id']}/{d['id']}/state",
@@ -414,12 +416,7 @@ def publish_discovery(p, d):
         "device_class": "duration",
         "state_class": "measurement",
         "icon": "mdi:car-clock",
-        "device": {
-            "identifiers": [f"{BASE}_{p['id']}"],
-            "name": f"{p['name']} Travel Times",
-            "manufacturer": "Travel Times add-on",
-            "model": "Waze travel time",
-        },
+        "device": DEVICE,
     }
     pub(disc_topic(p["id"], d["id"]), json.dumps(payload))
 
