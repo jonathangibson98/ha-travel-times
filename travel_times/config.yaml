@@ -1,5 +1,5 @@
 name: "Travel Times"
-version: "1.1.0"
+version: "1.2.0"
 slug: travel_times
 image: "ghcr.io/jonathangibson98/{arch}-addon-travel_times"
 description: "Near real-time Waze drive-time sensors for the routes you pick: person to place or person to person."
@@ -15,6 +15,13 @@ ingress_port: 8099
 panel_icon: "mdi:car-clock"
 panel_title: "Travel Times"
 homeassistant_api: true
+map:
+  - type: share
+    read_only: false
+  - type: media
+    read_only: false
+  - type: homeassistant_config
+    read_only: false
 services:
   - mqtt:want
 options:

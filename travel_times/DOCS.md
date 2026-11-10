@@ -24,3 +24,9 @@ Inside the arrival radius the sensor is 0 and no Waze call is made. A global cap
 ## Notes
 - Uses Waze's unofficial routing endpoint (same one the HA Waze integration uses). It can change or rate-limit without warning.
 - Location freshness is limited by how often the phone reports GPS.
+
+## Backups
+The Backup tab saves your people, places, routes and settings as a JSON file. Pick the folder with the folder picker:
+add-on storage (default, included in Home Assistant backups), `/share`, `/media` or `/config`.
+Turn on daily or weekly automatic backups and choose how many files to keep. Restore replaces your current setup with the chosen file
+(the backup folder and schedule are kept). Note: new folder access needs the add-on to be rebuilt/updated once so the share, media and config mappings apply.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0
+- New mobile-friendly web UI with a bottom menu: Live, Setup (People / Places / Routes), Find, Settings, Backup.
+- Settings are grouped into Waze, Update speed, Arrival & limits and AI place search, with a floating Save bar.
+- Backup tab: choose any folder (add-on storage, Share, Media or HA config) with a folder picker, back up now, optional daily/weekly automatic backups, keep-newest-N, restore, download and delete.
+- Neat labels and descriptions for the add-on Configuration tab.
+
 ## 1.1.0
 - Routes: choose exactly which person goes to which place (no more every-person-to-every-place). Existing sensors are kept.
 - Person to person: pick another person as a route's "To" and it follows them live.
