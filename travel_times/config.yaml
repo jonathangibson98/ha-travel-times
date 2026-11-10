@@ -1,5 +1,5 @@
 name: "Travel Times"
-version: "1.0.2"
+version: "1.0.3"
 slug: travel_times
 image: "ghcr.io/jonathangibson98/{arch}-addon-travel_times"
 description: "Near real-time Waze drive-time sensors from each person to each destination."

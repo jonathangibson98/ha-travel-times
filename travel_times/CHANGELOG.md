@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.0.3
+- Fix Waze 410 Gone: Waze retired the www.waze.com routing endpoints; use the routing-livemap-* hosts.
+
 ## 1.0.1
 - Fix repository URL; CI now checks the published image is publicly pullable.
 
