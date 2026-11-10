@@ -11,6 +11,7 @@
 - Places: a zone, "lat, lon", or a street address.
 - Routes: each route is one sensor. "From" is a person; "To" is a place or another person (follows them live).
   Existing setups keep their sensors; use "Everyone -> all places" to fill in every combination.
+- Groups: one sensor for 2+ people going to the same place (for example you and your partner heading home). The state follows the rule you pick (longest, shortest or combined total); attributes list each person and the total time and distance.
 - Find a place (AI): choose an `ai_task` entity in Settings, type e.g. "closest Lowe's", pick Near Home or a person, and tap Add.
   The model suggests places, the add-on geocodes the addresses for accurate coordinates, and the place is added with routes for the people ticked.
   Results are only as good as the model's knowledge; a model with web search gives the best results.
