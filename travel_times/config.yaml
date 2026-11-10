@@ -3,7 +3,7 @@ version: "1.0.1"
 slug: travel_times
 image: "ghcr.io/jonathangibson98/{arch}-addon-travel_times"
 description: "Near real-time Waze drive-time sensors from each person to each destination."
-url: "https://github.com/jonathangibson98/my-home-assistant-apps"
+url: "https://github.com/jonathangibson98/ha-travel-times"
 arch:
   - aarch64
   - amd64
