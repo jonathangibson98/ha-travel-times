@@ -1,1 +1,16 @@
-i
+configuration:
+  mqtt_host:
+    name: MQTT host
+    description: Leave empty to use the Mosquitto add-on automatically. Only fill this in for an external broker.
+  mqtt_port:
+    name: MQTT port
+    description: Broker port, normally 1883.
+  mqtt_user:
+    name: MQTT username
+    description: Only needed for an external broker.
+  mqtt_password:
+    name: MQTT password
+    description: Only needed for an external broker.
+  log_level:
+    name: Log level
+    description: Use debug to see every Waze calculation in the add-on log.
