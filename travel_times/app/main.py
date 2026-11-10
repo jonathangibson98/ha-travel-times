@@ -57,12 +57,12 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)
 log = logging.getLogger("travel_times")
 
 WAZE_URLS = {
-    "US": "https://www.waze.com/RoutingManager/routingRequest",
-    "EU": "https://www.waze.com/row-RoutingManager/routingRequest",
-    "AU": "https://www.waze.com/row-RoutingManager/routingRequest",
-    "IL": "https://www.waze.com/il-RoutingManager/routingRequest",
+    "US": "https://routing-livemap-am.waze.com/RoutingManager/routingRequest",
+    "EU": "https://routing-livemap-row.waze.com/RoutingManager/routingRequest",
+    "AU": "https://routing-livemap-row.waze.com/RoutingManager/routingRequest",
+    "IL": "https://routing-livemap-il.waze.com/RoutingManager/routingRequest",
 }
-WAZE_HEADERS = {"User-Agent": "Mozilla/5.0", "referer": "https://www.waze.com/live-map"}
+WAZE_HEADERS = {"User-Agent": "Mozilla/5.0", "referer": "https://www.waze.com/"}
 
 DEFAULT_SETTINGS = {
     "region": "US",
