@@ -1,6 +1,6 @@
 # 🚗 Home Assistant Travel Times Add-on (`ha-travel-times`)
 
-[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/username/ha-travel-times/create.yml?branch=main&style=for-the-badge)](https://github.com/username/ha-travel-times/actions)
+[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/jonathangibson98/ha-travel-times/create.yml?branch=main&style=for-the-badge)](https://github.com/jonathangibson98/ha-travel-times/actions)
 [![Home Assistant Add-on](https://img.shields.io/badge/Home%20Assistant-Add--on-blue?style=for-the-badge&logo=home-assistant)](https://www.home-assistant.io/)
 [![License](https://img.shields.io/badge/License-MIT-green.style=for-the-badge)](LICENSE)
 
@@ -55,7 +55,7 @@ ha-travel-times-main/
 3. Click the three dots in the top right corner and select **Repositories**.
 4. Add the URL of this GitHub repository:
    ```text
-   https://github.com/your-username/ha-travel-times
+   https://github.com/jonathangibson98/ha-travel-times
    ```
 5. Click **Add**, close the dialog, and refresh the store page.
 6. Scroll down to find **Travel Times** and click **Install**.
