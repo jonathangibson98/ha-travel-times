@@ -19,6 +19,10 @@ from datetime import datetime, timedelta
 
 import paho.mqtt.client as mqtt
 import requests
+try:
+    from curl_cffi import requests as cffi_requests
+except Exception:  # falls back to plain requests (Waze will likely answer 403)
+    cffi_requests = None
 from flask import Flask, Response, jsonify, request
 
 DATA = os.environ.get("TT_DATA", "/data")
@@ -62,6 +66,7 @@ WAZE_URLS = {
     "AU": "https://routing-livemap-row.waze.com/RoutingManager/routingRequest",
     "IL": "https://routing-livemap-il.waze.com/RoutingManager/routingRequest",
 }
+WAZE_IMPERSONATE = ["chrome", "firefox"]  # floating targets track the newest browser
 WAZE_HEADERS = {"User-Agent": "Mozilla/5.0", "referer": "https://www.waze.com/"}
 
 DEFAULT_SETTINGS = {
@@ -217,6 +222,20 @@ def street_name(route):
         return ""
 
 
+def waze_get(url, params):
+    """Waze now rejects non-browser TLS fingerprints with 403, so impersonate a real browser.
+    Tries each target until one is not 403 (Waze has blocked pinned Chrome versions before)."""
+    if cffi_requests is None:
+        return requests.get(url, params=params, headers=WAZE_HEADERS, timeout=15)
+    r = None
+    for target in WAZE_IMPERSONATE:
+        r = cffi_requests.get(url, params=params, headers=WAZE_HEADERS,
+                              impersonate=target, timeout=15)
+        if r.status_code != 403:
+            break
+    return r
+
+
 def waze_route(origin, dest, s):
     opts = ["AVOID_TRAILS:t"]
     if s.get("avoid_tolls"):
@@ -232,8 +251,7 @@ def waze_route(origin, dest, s):
         "nPaths": 1,
         "options": ",".join(opts),
     }
-    r = requests.get(WAZE_URLS.get(s["region"], WAZE_URLS["US"]), params=params,
-                     headers=WAZE_HEADERS, timeout=15)
+    r = waze_get(WAZE_URLS.get(s["region"], WAZE_URLS["US"]), params)
     if r.status_code == 429:
         raise RateLimited()
     r.raise_for_status()
