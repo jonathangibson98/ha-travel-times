@@ -12,6 +12,8 @@ An intuitive, powerful **Home Assistant Add-on** that calculates real-time trave
 
 - **Real-Time Traffic Monitoring**: Fetch live traffic conditions and estimated travel durations.
 - **Dynamic Origin & Destination**: Track stationary locations (e.g., Home, Work) or dynamic entities (e.g., `person` or `device_tracker` entities).
+- **Distance Trackers**: See how far 2 people are from each other, or track every pair in a group (drive time, road distance and straight-line distance).
+- **Fast Address Search**: Parallel US Census + OpenStreetMap + Photon lookup with search-as-you-type, no AI wait.
 - **Home Assistant Native Integration**: Exposes sensors directly into Home Assistant via MQTT or API integration.
 - **Automated Workflows**: Built-in GitHub Actions (`create.yml`) for automated container building and release management.
 - **Multilingual Support**: Fully localizable interface with base English support (`en.yaml`).
