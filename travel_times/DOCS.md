@@ -11,7 +11,8 @@
 - Places: a zone, "lat, lon", or a street address.
 - Routes: each route is one sensor. "From" is a person; "To" is a place or another person (follows them live).
   Existing setups keep their sensors; use "Everyone -> all places" to fill in every combination.
-- Groups: one sensor for 2+ people going to the same place (for example you and your partner heading home). The state follows the rule you pick (longest, shortest or combined total); attributes list each person and the total time and distance.
+- Routes: grouped by person. Tap a person's name to track every place for them; tap a chip to turn a single route on or off.
+- Groups: 2+ people going to one or more places (for example you and your partner heading home or to the airport). Each destination you pick gets its own sensor. The state follows the rule you pick (longest, shortest or combined total); attributes list each person and the total time and distance.
 - Trackers: how far apart people are. Pick 2 people for one tracker, or 3+ and every pair is tracked (3 people = 3 pairs, 4 = 6, up to 8).
   Each tracker makes a drive-time sensor and a distance sensor. Choose what they report: the farthest pair (how spread out the group is), the closest pair, or the average.
   Attributes list every pair (drive minutes, road distance, straight-line distance) plus the closest and farthest pair. Tick "Also make a sensor for each pair" for one sensor per combination.
@@ -27,6 +28,9 @@
 Every 5s the add-on reads each person's GPS from HA. If someone moved more than the threshold since the last
 Waze call, the pair refreshes every "moving" interval (default 60s). Otherwise every "parked" interval (default 10 min).
 Inside the arrival radius the sensor is 0 and no Waze call is made. A global cap (default 20 calls/min) protects you from Waze.
+
+## Who can see what
+Home Assistant admins see every menu. Any other Home Assistant user who opens the add-on gets the Live page only. The add-on reads who is asking from the ingress headers and checks that user against Home Assistant's user list (refreshed every minute); the server rejects every other request from non-admins, so it is not just hidden. If Home Assistant can't be asked, or a request carries no user, nobody is treated as admin; check the add-on log for "Could not check admin users".
 
 ## Notes
 - Uses Waze's unofficial routing endpoint (same one the HA Waze integration uses). It can change or rate-limit without warning.

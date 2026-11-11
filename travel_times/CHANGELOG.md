@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.0
+- Groups can go to several places: pick any number of destinations on one group and each gets its own sensor ("Family to Home", "Family to Airport"). No more duplicate groups with the same members. Existing groups migrate automatically and keep their current sensor and history.
+- Routes tab is now organised by person. Tap a person's name to track every place for them, or tap individual place / person chips to switch a route on or off. "Clear" removes a person's routes.
+- Setup is tidier: People, Places, Groups, Trackers and every Settings section are collapsible cards that show a one-line summary and open only when you tap them.
+- Admin only: Home Assistant admins see every menu. Anyone else who opens the add-on sees only the Live page, with no menus and no way to change anything. This is enforced on the server too, not just hidden. Viewers are sent names and times only, never entity ids, addresses, coordinates or settings.
+- The add-on now appears in the sidebar for non-admin users (panel_admin is off); the add-on itself decides who sees what. Needs one rebuild/update for the new dependency (websocket-client).
+
 ## 1.4.0
 - Trackers: new Setup > Trackers tab. Pick 2 people to see how far apart they are, or pick a whole group and every pair is tracked (3 people = 3 pairs, 4 = 6, up to 8 people). Each tracker gets a drive-time sensor and a distance sensor; choose whether they report the farthest pair, the closest pair or the average. Attributes list every pair with road and straight-line distance, and which pair is closest/farthest. Optional: a separate sensor for each pair. Shows live under "Between people".
 - Fast address search (ported from the Zone Creator add-on): US Census, OpenStreetMap and Photon are asked at the same time and results show as soon as the first one answers (no more waiting on AI). New "Address (fast)" mode on the Find tab with search-as-you-type, distance from home or a person, and "lat, lon" paste support. AI search is still there as the second mode.
