@@ -5,20 +5,31 @@
 * Asks Waze for the drive time to every destination you pick
 * Polls FAST while someone is moving, SLOW while they sit still
 * Publishes one sensor per person+destination through MQTT discovery
+* Groups: one sensor for 2+ people going to the same place
+* Trackers: how far apart 2+ people are from each other (every pair tracked)
+* Fast address search (US Census + OpenStreetMap + Photon, asked in parallel)
 """
+import itertools
 import json
 import logging
 import math
 import os
 import re
+import socket
 import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from datetime import datetime, timedelta
 
 import paho.mqtt.client as mqtt
 import requests
+import urllib3.util.connection as _u3c
+
+# IPv4 only: IPv6 lookups hang on some Docker/HAOS networks (this made address lookups crawl)
+_u3c.allowed_gai_family = lambda: socket.AF_INET
 try:
     from curl_cffi import requests as cffi_requests
 except Exception:  # falls back to plain requests (Waze will likely answer 403)
@@ -100,6 +111,11 @@ paused_until = 0.0
 mq = None
 group_cache = {}         # gid -> last published payload
 group_live = {}          # gid -> live info for the UI
+tracker_cache = {}       # tid -> last published payload
+tracker_live = {}        # tid -> live info for the UI
+person_locs = {}         # person id -> (lat, lon) from the latest tick
+search_cache = {}        # (query, near, quick) -> (time, results)
+_home_cache = {"t": 0.0, "pt": None}
 
 
 # ----------------------------------------------------------------- helpers
@@ -121,6 +137,7 @@ def load_cfg():
     c.setdefault("people", [])
     c.setdefault("destinations", [])
     c.setdefault("groups", [])
+    c.setdefault("trackers", [])
     if "routes" not in c:  # older versions tracked every person -> every destination
         c["routes"] = [{"from": p["id"], "to": d["id"]} for p in c["people"] for d in c["destinations"]]
     s = dict(DEFAULT_SETTINGS)
@@ -160,7 +177,20 @@ def all_pairs(c):
         for m in g.get("members", []):
             if d and m in people and m != d["id"]:
                 out.setdefault((m, d["id"]), (people[m], d))
+    for t in c.get("trackers", []):  # person <-> person: one Waze call per pair, reused if a route exists
+        for a, b in tracker_pairs(t):
+            if a in people and b in people and (a, b) not in out and (b, a) not in out:
+                out[(a, b)] = (people[a], ends[b])
     return out
+
+
+def tracker_pairs(t):
+    """Every pair of members: 2 people = 1 pair, 3 = 3, 4 = 6 ..."""
+    return list(itertools.combinations(t.get("members", []), 2))
+
+
+def pair_status(snap, a, b):
+    return snap.get(f"{a}|{b}") or snap.get(f"{b}|{a}") or {}
 
 
 # ----------------------------------------------------------- Home Assistant
@@ -204,6 +234,132 @@ def list_entities():
 
 
 # ---------------------------------------------------------------- geocoding
+GEO_UA = "ha-travel-times-addon/1.4 (Home Assistant add-on)"
+_nom_lock = threading.Lock()
+_nom_last = 0.0
+
+
+def _get_json(url, params, timeout=8):
+    r = requests.get(url, params=params, headers={"User-Agent": GEO_UA}, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def geo_census(q, near=None):
+    """US street addresses. Exact and free, but US only."""
+    data = _get_json("https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
+                     {"address": q, "benchmark": "Public_AR_Current", "format": "json"})
+    out = []
+    for m in data.get("result", {}).get("addressMatches", []):
+        name = m["matchedAddress"].title()
+        name = re.sub(r",\s*([A-Za-z]{2}),", lambda x: ", " + x.group(1).upper() + ",", name)
+        out.append({"name": name.split(",")[0], "address": name,
+                    "lat": float(m["coordinates"]["y"]), "lon": float(m["coordinates"]["x"])})
+    return out
+
+
+def geo_nominatim(q, near=None):
+    """OpenStreetMap: addresses and business names worldwide. Policy: max 1 request/second."""
+    global _nom_last
+    with _nom_lock:
+        gap = 1.1 - (time.time() - _nom_last)
+        if gap > 0:
+            time.sleep(gap)
+        _nom_last = time.time()
+    params = {"q": q, "format": "jsonv2", "limit": "6"}
+    if near:  # prefer (not force) results near the reference point
+        params.update(viewbox=f"{near[1] - .5},{near[0] + .5},{near[1] + .5},{near[0] - .5}", bounded="0")
+    out = []
+    for d in _get_json("https://nominatim.openstreetmap.org/search", params):
+        label = d.get("display_name", "")
+        out.append({"name": d.get("name") or label.split(",")[0], "address": label,
+                    "lat": float(d["lat"]), "lon": float(d["lon"])})
+    return out
+
+
+def geo_photon(q, near=None):
+    """Photon (OSM): quick, typo tolerant, and can be biased toward a point."""
+    params = {"q": q, "limit": "6"}
+    if near:
+        params.update(lat=f"{near[0]:.5f}", lon=f"{near[1]:.5f}")
+    out = []
+    for f in _get_json("https://photon.komoot.io/api/", params).get("features", []):
+        p = f.get("properties", {})
+        street = " ".join(x for x in [p.get("housenumber"), p.get("street")] if x)
+        parts = [p.get("name"), street, p.get("city") or p.get("town") or p.get("county"),
+                 p.get("state"), p.get("postcode")]
+        label = ", ".join(dict.fromkeys(x for x in parts if x))
+        lon, lat = f["geometry"]["coordinates"]
+        out.append({"name": p.get("name") or street or label.split(",")[0], "address": label,
+                    "lat": float(lat), "lon": float(lon)})
+    return out
+
+
+# merge order = priority (Census is the most exact for US street addresses)
+GEO_PROVIDERS = [("Census", geo_census), ("Photon", geo_photon), ("OpenStreetMap", geo_nominatim)]
+GEO_GRACE = 1.2       # after the first provider answers, wait this long for the others
+GEO_DEADLINE = 9.0    # never wait longer than this in total
+
+
+def search_address(q, near=None, limit=8, quick=False):
+    """Ask the geocoders at the same time and answer as soon as the first one has results.
+    quick=True asks only Photon (made for search-as-you-type). Returns (results, errors)."""
+    q = (q or "").strip()
+    m = COORD_RE.match(q)
+    if m:
+        lat, lon = float(m.group(1)), float(m.group(2))
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return [{"name": "Dropped pin", "address": f"{lat:.6f}, {lon:.6f}", "lat": lat, "lon": lon,
+                     "dist_m": round(haversine(near, (lat, lon))) if near else None,
+                     "source": "coordinates"}], []
+    key = (q.lower(), tuple(round(x, 2) for x in near) if near else None, quick)
+    hit = search_cache.get(key)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1], []
+
+    providers = [x for x in GEO_PROVIDERS if x[0] == "Photon"] if quick else GEO_PROVIDERS
+    ex = ThreadPoolExecutor(max_workers=len(providers))
+    futs = {ex.submit(fn, q, near): name for name, fn in providers}
+    got, errors = {}, []
+    pending, t0, first = set(futs), time.time(), None
+    while pending:
+        left = GEO_DEADLINE - (time.time() - t0)
+        if first is not None:
+            left = min(left, GEO_GRACE - (time.time() - first))
+        if left <= 0:
+            break
+        done, pending = futures_wait(pending, timeout=left, return_when=FIRST_COMPLETED)
+        for f in done:
+            name = futs[f]
+            try:
+                got[name] = f.result()
+                if got[name] and first is None:
+                    first = time.time()
+            except Exception as e:
+                errors.append(f"{name}: {type(e).__name__} {str(e)[:80]}")
+                log.debug("Geocoder %s failed: %s", name, e)
+    for f in pending:
+        errors.append(f"{futs[f]}: too slow")
+    ex.shutdown(wait=False, cancel_futures=True)
+
+    out, seen = [], set()
+    for name, _ in providers:
+        for r in got.get(name, []):
+            k = (round(r["lat"], 4), round(r["lon"], 4))
+            if k in seen:
+                continue
+            seen.add(k)
+            r["source"] = name
+            r["dist_m"] = round(haversine(near, (r["lat"], r["lon"]))) if near else None
+            out.append(r)
+    out = out[:limit]
+    if out:
+        if len(search_cache) > 300:
+            search_cache.clear()
+        search_cache[key] = (time.time(), out)
+    return out, errors
+
+
 def geocode(addr):
     key = addr.strip().lower()
     with lock:
@@ -212,20 +368,15 @@ def geocode(addr):
         if time.time() < geo_fail.get(key, 0):
             return None
     try:
-        time.sleep(1.1)  # Nominatim asks for max 1 request/second
-        r = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": addr, "format": "jsonv2", "limit": 1},
-            headers={"User-Agent": "ha-travel-times-addon/1.0"},
-            timeout=12,
-        )
-        js = r.json()
-        if js:
-            pt = (float(js[0]["lat"]), float(js[0]["lon"]))
+        res, errs = search_address(addr, limit=1)
+        if res:
+            pt = (res[0]["lat"], res[0]["lon"])
             with lock:
                 geocache[key] = list(pt)
                 save_json(GEO_FILE, geocache)
             return pt
+        if errs:
+            log.warning("Geocode failed for %r: %s", addr, "; ".join(errs))
     except Exception as e:
         log.warning("Geocode failed for %r: %s", addr, e)
     with lock:
@@ -394,6 +545,158 @@ def publish_groups():
         pub(f"{BASE}/group/{g['id']}/attrs", json.dumps(attrs))
 
 
+# ------------------------------------------------------------ tracker sensors
+# A tracker shows how far apart 2+ people are. Every pair of members is tracked
+# (2 people = 1 pair, 3 = 3, 4 = 6 ...). Each tracker gets a drive-time sensor and a
+# distance sensor; the mode picks which pair they report (farthest, closest, average).
+# Optional: one extra sensor per pair.
+TRACKER_MODES = ("max", "min", "avg")
+
+
+def tracker_disc(tid, kind):
+    return f"homeassistant/sensor/{BASE}_tracker_{tid}_{kind}/config"
+
+
+def tracker_pair_disc(tid, key):
+    return f"homeassistant/sensor/{BASE}_tracker_{tid}_p_{key}/config"
+
+
+def tracker_topics(c):
+    """Every discovery topic the trackers in this config own (used to delete stale entities)."""
+    out = set()
+    for t in c.get("trackers", []):
+        out.add(tracker_disc(t["id"], "time"))
+        out.add(tracker_disc(t["id"], "dist"))
+        if t.get("pair_sensors"):
+            for a, b in tracker_pairs(t):
+                out.add(tracker_pair_disc(t["id"], f"{a}_{b}"))
+    return out
+
+
+def conv_dist(v, frm, to):
+    if v is None or not frm or frm == to:
+        return v
+    return v * 1.609344 if frm == "mi" else v / 1.609344
+
+
+def tracker_state(c, t, snap, locs):
+    """Summary for one tracker. Always returns the live pair info (straight-line distance works
+    before the first Waze answer); minutes/distance stay None until a pair has a result."""
+    people = {p["id"]: p for p in c["people"]}
+    unit = "mi" if c["settings"]["units"] == "imperial" else "km"
+    div = 1609.344 if unit == "mi" else 1000.0
+    pairs = []
+    for a, b in tracker_pairs(t):
+        if a not in people or b not in people:
+            continue
+        st = pair_status(snap, a, b)
+        la, lb = locs.get(a), locs.get(b)
+        mins = st.get("minutes")
+        dist = conv_dist(st.get("distance"), st.get("unit"), unit) if mins is not None else None
+        pairs.append({
+            "key": f"{a}_{b}", "a": people[a]["name"], "b": people[b]["name"],
+            "minutes": mins, "distance": round(dist, 1) if dist is not None else None,
+            "straight_line": round(haversine(la, lb) / div, 1) if la and lb else None,
+            "arrived": bool(st.get("arrived")), "error": st.get("error"),
+        })
+    if not pairs:
+        return None
+    mode = t.get("mode", "max")
+
+    def agg(vals):
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            return None
+        return round({"max": max(vals), "min": min(vals), "avg": sum(vals) / len(vals)}[mode], 1)
+
+    ready = [x for x in pairs if x["minutes"] is not None]
+    far = max(ready, key=lambda x: x["minutes"]) if ready else None
+    near = min(ready, key=lambda x: x["minutes"]) if ready else None
+    return {
+        "name": t["name"], "mode": mode, "unit": unit, "pairs": pairs,
+        "minutes": agg(x["minutes"] for x in pairs), "distance": agg(x["distance"] for x in pairs),
+        "straight_line": agg(x["straight_line"] for x in pairs),
+        "ready": len(ready), "pair_count": len(pairs),
+        "together": bool(ready) and all(x["arrived"] for x in ready),
+        "farthest_pair": f"{far['a']} & {far['b']}" if far else None,
+        "closest_pair": f"{near['a']} & {near['b']}" if near else None,
+    }
+
+
+def publish_tracker_discovery(c, t):
+    unit = "mi" if c["settings"]["units"] == "imperial" else "km"
+    people = {p["id"]: p for p in c["people"]}
+    tid, base = t["id"], f"{BASE}/tracker/{t['id']}"
+    common = {"availability_topic": STATUS_TOPIC, "state_class": "measurement", "device": DEVICE,
+              "json_attributes_topic": f"{base}/attrs"}
+    pub(tracker_disc(tid, "time"), json.dumps({
+        **common, "name": f"{t['name']} drive time", "unique_id": f"{BASE}_tracker_{tid}_time",
+        "default_entity_id": f"sensor.{slug(t['name'])}_drive_time", "state_topic": f"{base}/time",
+        "unit_of_measurement": "min", "device_class": "duration", "icon": "mdi:car-multiple"}))
+    pub(tracker_disc(tid, "dist"), json.dumps({
+        **common, "name": f"{t['name']} distance", "unique_id": f"{BASE}_tracker_{tid}_dist",
+        "default_entity_id": f"sensor.{slug(t['name'])}_distance", "state_topic": f"{base}/dist",
+        "unit_of_measurement": unit, "device_class": "distance", "icon": "mdi:map-marker-distance"}))
+    if t.get("pair_sensors"):
+        for a, b in tracker_pairs(t):
+            if a not in people or b not in people:
+                continue
+            key, an, bn = f"{a}_{b}", people[a]["name"], people[b]["name"]
+            pub(tracker_pair_disc(tid, key), json.dumps({
+                "name": f"{an} and {bn} drive time", "unique_id": f"{BASE}_tracker_{tid}_p_{key}",
+                "default_entity_id": f"sensor.{slug(an)}_and_{slug(bn)}_drive_time",
+                "state_topic": f"{base}/pair/{key}/state", "json_attributes_topic": f"{base}/pair/{key}/attrs",
+                "availability_topic": STATUS_TOPIC, "unit_of_measurement": "min",
+                "device_class": "duration", "state_class": "measurement", "icon": "mdi:map-marker-distance",
+                "device": DEVICE}))
+
+
+def publish_trackers():
+    with lock:
+        c = json.loads(json.dumps(cfg))
+        snap = {k: dict(v) for k, v in status.items()}
+        locs = dict(person_locs)
+    for t in c.get("trackers", []):
+        r = tracker_state(c, t, snap, locs)
+        if not r:
+            continue
+        with lock:
+            tracker_live[t["id"]] = {k: r[k] for k in (
+                "minutes", "distance", "straight_line", "unit", "mode", "pairs", "ready", "pair_count",
+                "together", "farthest_pair", "closest_pair")}
+            tracker_live[t["id"]]["t"] = time.time()
+        if r["minutes"] is None:
+            continue  # nothing calculated yet
+        key = json.dumps([r["minutes"], r["distance"], r["straight_line"], r["mode"], r["unit"], r["pairs"]])
+        with lock:
+            if tracker_cache.get(t["id"]) == key:
+                continue
+            tracker_cache[t["id"]] = key
+        ready = [x for x in r["pairs"] if x["minutes"] is not None]
+        base = f"{BASE}/tracker/{t['id']}"
+        attrs = {
+            "mode": r["mode"], "pair_count": r["pair_count"], "pairs_ready": r["ready"],
+            "together": r["together"], "distance_unit": r["unit"],
+            "straight_line_distance": r["straight_line"],
+            "farthest_pair": r["farthest_pair"], "closest_pair": r["closest_pair"],
+            "longest_minutes": max(x["minutes"] for x in ready),
+            "shortest_minutes": min(x["minutes"] for x in ready),
+            "average_minutes": round(sum(x["minutes"] for x in ready) / len(ready), 1),
+            "pairs": [{k: v for k, v in x.items() if k != "key"} for x in r["pairs"]],
+            "last_calculated": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        pub(f"{base}/time", str(r["minutes"]))
+        if r["distance"] is not None:
+            pub(f"{base}/dist", str(r["distance"]))
+        pub(f"{base}/attrs", json.dumps(attrs))
+        if t.get("pair_sensors"):
+            for x in ready:
+                pub(f"{base}/pair/{x['key']}/state", str(x["minutes"]))
+                pub(f"{base}/pair/{x['key']}/attrs", json.dumps({
+                    "between": [x["a"], x["b"]], "distance": x["distance"], "distance_unit": r["unit"],
+                    "straight_line_distance": x["straight_line"], "arrived": x["arrived"]}))
+
+
 # --------------------------------------------------------------------- MQTT
 def pub(topic, payload, retain=True):
     if mq is not None:
@@ -440,6 +743,10 @@ def republish_all():
         publish_group_discovery(g, ends)
     group_cache.clear()
     publish_groups()
+    for t in c.get("trackers", []):
+        publish_tracker_discovery(c, t)
+    tracker_cache.clear()
+    publish_trackers()
 
 
 def on_connect(client, userdata, flags, rc):
@@ -521,6 +828,9 @@ def tick():
         return
 
     locs = {p["id"]: ha_coords(p["entity"]) for p in c["people"]}
+    with lock:
+        person_locs.clear()
+        person_locs.update({k: v for k, v in locs.items() if v})
     dcoords = {}
     for (_, did), (_, d) in routes.items():
         if did not in dcoords:
@@ -587,6 +897,10 @@ def worker():
             publish_groups()
         except Exception:
             log.exception("group publish crashed")
+        try:
+            publish_trackers()
+        except Exception:
+            log.exception("tracker publish crashed")
         try:
             maybe_auto_backup()
         except Exception:
@@ -721,6 +1035,21 @@ def clean_cfg(body):
             groups.append({"id": new_id(g.get("id")), "name": name, "members": members[:8], "to": to,
                            "mode": g.get("mode") if g.get("mode") in ("max", "min", "sum") else "max"})
 
+    trackers, pname = [], {p["id"]: p["name"] for p in people}
+    for t in (body.get("trackers") or [])[:20]:
+        members = []
+        for m in t.get("members") or []:
+            m = idmap.get(str(m))
+            if m in person_ids and m not in members:
+                members.append(m)
+        members = members[:8]
+        if len(members) < 2:
+            continue
+        name = str(t.get("name", "")).strip()[:40] or " & ".join(pname[m] for m in members)[:40]
+        trackers.append({"id": new_id(t.get("id")), "name": name, "members": members,
+                         "mode": t.get("mode") if t.get("mode") in TRACKER_MODES else "max",
+                         "pair_sensors": bool(t.get("pair_sensors"))})
+
     b = body.get("settings") or {}
     s = dict(DEFAULT_SETTINGS)
     s["region"] = b.get("region") if b.get("region") in WAZE_URLS else "US"
@@ -737,7 +1066,8 @@ def clean_cfg(body):
     s["backup_dir"] = safe_dir(str(b.get("backup_dir") or "").strip()) or DEFAULT_SETTINGS["backup_dir"]
     s["backup_auto"] = b.get("backup_auto") if b.get("backup_auto") in ("off", "daily", "weekly") else "off"
     s["backup_keep"] = clamp(b.get("backup_keep"), 1, 100, 10)
-    return {"people": people, "destinations": dests, "routes": routes, "groups": groups, "settings": s}
+    return {"people": people, "destinations": dests, "routes": routes, "groups": groups,
+            "trackers": trackers, "settings": s}
 
 
 def apply_cfg(new):
@@ -763,6 +1093,11 @@ def apply_cfg(new):
             pub(group_disc_topic(gid), "")
             group_cache.pop(gid, None)
             group_live.pop(gid, None)
+        for topic in tracker_topics(old) - tracker_topics(new):
+            pub(topic, "")  # tracker removed, or its per-pair sensors switched off / members changed
+        for tid in {t["id"] for t in old.get("trackers", [])} - {t["id"] for t in new.get("trackers", [])}:
+            tracker_cache.pop(tid, None)
+            tracker_live.pop(tid, None)
         cfg = new
         save_json(CFG_FILE, new)
     republish_all()
@@ -774,9 +1109,13 @@ def near_point(near):
         pt = ha_coords(near)
         if pt:
             return pt, "the person's current location"
+    if _home_cache["pt"] and time.time() - _home_cache["t"] < 300:
+        return _home_cache["pt"], "home"
     try:
         j = requests.get(f"{HA}/config", headers=HDR, timeout=8).json()
-        return (float(j["latitude"]), float(j["longitude"])), "home"
+        pt = (float(j["latitude"]), float(j["longitude"]))
+        _home_cache.update(t=time.time(), pt=pt)
+        return pt, "home"
     except Exception:
         return None, ""
 
@@ -853,6 +1192,8 @@ def status_public():
                for k, v in status.items()}
         for gid, v in group_live.items():
             out[f"g|{gid}"] = v
+        for tid, v in tracker_live.items():
+            out[f"t|{tid}"] = v
         return out
 
 
@@ -895,6 +1236,21 @@ def api_search():
     except Exception as e:
         log.warning("Place search failed: %s", e)
         return jsonify(error=str(e)[:300]), 502
+
+
+@app.get("/api/geosearch")
+def api_geosearch():
+    """Fast address / place search (no AI). quick=1 = single provider, for search-as-you-type."""
+    q = request.args.get("q", "").strip()[:200]
+    if len(q) < 2:
+        return jsonify(results=[], errors=[])
+    near, _ = near_point(request.args.get("near") or "home")
+    try:
+        res, errs = search_address(q, near, quick=request.args.get("quick") == "1")
+    except Exception as e:
+        log.warning("Address search failed: %s", e)
+        return jsonify(results=[], errors=[str(e)[:120]])
+    return jsonify(results=res, errors=errs)
 
 
 @app.get("/api/browse")
@@ -1033,8 +1389,10 @@ button.d{color:var(--bad)}button.ico{padding:8px 12px;font-size:18px}button:disa
 .field{margin-bottom:12px}.field:last-child{margin-bottom:0}
 label.l{display:block;font-size:13px;color:var(--mu);margin-bottom:4px}
 .hint{font-size:12px;color:var(--mu);margin-top:4px}
-.seg{display:flex;background:#12121f;border:1px solid var(--line);border-radius:12px;padding:3px;margin-bottom:12px}
-.seg button{flex:1;border:0;background:transparent;min-height:40px;padding:6px 4px;font-size:14px}.seg button.on{background:var(--ac);color:#04121c;font-weight:700}
+.seg{display:flex;background:#12121f;border:1px solid var(--line);border-radius:12px;padding:3px;margin-bottom:12px;overflow-x:auto;scrollbar-width:none}
+.seg button{flex:1 0 auto;border:0;background:transparent;min-height:40px;padding:6px 10px;font-size:14px;white-space:nowrap}.seg button.on{background:var(--ac);color:#04121c;font-weight:700}
+.pairs{margin-top:6px;font-size:13px;color:var(--mu);line-height:1.5}.pairs b{color:var(--tx);font-weight:600}
+.src{font-size:11px;color:var(--mu);border:1px solid var(--line);border-radius:8px;padding:1px 6px;margin-left:6px;white-space:nowrap}
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
 .chip{display:flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--line);border-radius:20px;font-size:14px}
 .nav{position:fixed;left:0;right:0;bottom:0;z-index:6;display:flex;background:#0d0d0dfa;border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
@@ -1052,11 +1410,12 @@ label.l{display:block;font-size:13px;color:var(--mu);margin-bottom:4px}
 <section id="p-live" class="pg"><div id="live"><div class="sub">Loading…</div></div></section>
 <section id="p-setup" class="pg hid">
  <div class="seg" id="seg"></div>
- <div id="s-people"></div><div id="s-places" class="hid"></div><div id="s-routes" class="hid"></div><div id="s-groups" class="hid"></div>
+ <div id="s-people"></div><div id="s-places" class="hid"></div><div id="s-routes" class="hid"></div><div id="s-groups" class="hid"></div><div id="s-trackers" class="hid"></div>
 </section>
 <section id="p-find" class="pg hid">
+ <div class="seg" id="fseg"></div>
  <div class="card stack">
-  <input id="q" placeholder="e.g. closest Lowe's, Mario's Pizza downtown" enterkeyhint="search" onkeydown="if(event.key==='Enter')doSearch()">
+  <input id="q" autocomplete="off" enterkeyhint="search" oninput="typeahead()" onkeydown="if(event.key==='Enter')doSearch()">
   <select id="near"></select>
   <div><div class="sub">Also add routes from:</div><div id="sopts" class="chips"></div></div>
   <button class="p" onclick="doSearch()">Search</button>
@@ -1072,7 +1431,7 @@ label.l{display:block;font-size:13px;color:var(--mu);margin-bottom:4px}
 <nav class="nav" id="nav"></nav>
 <div id="sheet" class="sheet" onclick="if(event.target===this)closeSheet()"><div id="sheetbody"></div></div>
 <script>
-let S=null,SR=[],BR=null,BK=null,page='live',sub='people',dirty=false;
+let S=null,SR=[],BR=null,BK=null,page='live',sub='people',dirty=false,fmode='quick',qseq=0,qtimer=null;
 const OFF=new Set();const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const rid=()=>{const a=new Uint8Array(4);if(window.crypto&&crypto.getRandomValues)crypto.getRandomValues(a);else a.forEach((_,i)=>a[i]=Math.random()*256);return Array.from(a,b=>b.toString(16).padStart(2,'0')).join('')};
@@ -1088,20 +1447,23 @@ function go(k){
   if(k==='backup')loadBackups();window.scrollTo(0,0);
 }
 async function load(){
-  const r=await fetch('api/config');S=await r.json();S.config.routes=S.config.routes||[];S.config.groups=S.config.groups||[];
+  const r=await fetch('api/config');S=await r.json();S.config.routes=S.config.routes||[];S.config.groups=S.config.groups||[];S.config.trackers=S.config.trackers||[];
   $('#dl').innerHTML=[...S.zones,...S.trackers].map(o=>`<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
   dirty=false;$('#savebar').classList.add('hid');renderAll();
 }
-function renderAll(){renderSeg();renderPeople();renderDests();renderRoutes();renderGroups();renderSearchOpts();renderSettings();renderBackup();renderLive(S.status)}
+function renderAll(){renderSeg();renderPeople();renderDests();renderRoutes();renderGroups();renderTrackers();renderFind();renderSearchOpts();renderSettings();renderBackup();renderLive(S.status)}
 function dropRoutes(id){
   S.config.routes=S.config.routes.filter(r=>r.from!==id&&r.to!==id);
   S.config.groups.forEach(g=>{g.members=g.members.filter(m=>m!==id)});
   S.config.groups=S.config.groups.filter(g=>g.to!==id&&g.members.length>=2);
+  S.config.trackers.forEach(t=>{t.members=t.members.filter(m=>m!==id)});
+  S.config.trackers=S.config.trackers.filter(t=>t.members.length>=2);
 }
 function renderSeg(){
-  const C=S.config,t=[['people','People',C.people.length],['places','Places',C.destinations.length],['routes','Routes',C.routes.length],['groups','Groups',C.groups.length]];
+  const C=S.config,t=[['people','People',C.people.length],['places','Places',C.destinations.length],['routes','Routes',C.routes.length],['groups','Groups',C.groups.length],['trackers','Trackers',C.trackers.length]];
   $('#seg').innerHTML=t.map(([k,l,n])=>`<button class="${sub===k?'on':''}" onclick="setSub('${k}')">${l} (${n})</button>`).join('');
   t.forEach(([k])=>$('#s-'+k).classList.toggle('hid',k!==sub));
+  const on=$('#seg .on');if(on&&on.scrollIntoView)on.scrollIntoView({block:'nearest',inline:'center'});
 }
 function setSub(k){sub=k;renderSeg()}
 function card(){const c=document.createElement('div');c.className='card stack';return c}
@@ -1126,11 +1488,14 @@ function renderDests(){
     const c=card();
     const nm=document.createElement('input');nm.placeholder='Name (Work)';nm.value=d.name||'';nm.oninput=()=>{d.name=nm.value;touch();renderRoutes();renderLive(S.status)};
     const tg=document.createElement('input');tg.placeholder='zone.work, 34.5,-82.6, or address';tg.setAttribute('list','dl');tg.value=d.target||'';tg.oninput=()=>{d.target=tg.value;touch()};
+    const sb=document.createElement('button');sb.className='ico';sb.textContent='🔎';sb.setAttribute('aria-label','Search address');
+    sb.onclick=()=>openAddrSheet(x=>{d.target=`${x.lat}, ${x.lon}`;if(!(d.name||'').trim())d.name=(x.name||'').slice(0,40);touch();renderDests();renderRoutes();renderLive(S.status)});
+    const row=document.createElement('div');row.className='hrow';row.append(tg,sb);
     const rm=document.createElement('button');rm.className='d';rm.textContent='Remove place';rm.onclick=()=>{dropRoutes(d.id);S.config.destinations.splice(i,1);touch();renderAll()};
-    c.append(nm,tg,rm);el.append(c);
+    c.append(nm,row,rm);el.append(c);
   });
   const add=document.createElement('button');add.className='p';add.textContent='+ Add place';add.onclick=()=>{S.config.destinations.push({id:rid(),name:'',target:''});touch();renderAll()};
-  el.append(add);el.insertAdjacentHTML('beforeend','<div class="hint">A place can be a zone, "lat, lon", or a street address. Use the Find tab to search with AI.</div>');
+  el.append(add);el.insertAdjacentHTML('beforeend','<div class="hint">A place can be a zone, "lat, lon", or a street address. Tap 🔎 to search an address, or use the Find tab.</div>');
 }
 function renderRoutes(){
   const el=$('#s-routes');el.innerHTML='';
@@ -1178,6 +1543,36 @@ function renderGroups(){
   el.append(add);
   el.insertAdjacentHTML('beforeend','<div class="hint">A group is one sensor for several people going to the same place, e.g. you and your partner heading home. The sensor shows the time by the rule you pick, and its attributes list each person plus the combined total time and distance.</div>');
 }
+const TMODES=[['max','Show farthest pair'],['min','Show closest pair'],['avg','Show average of pairs']];
+const nPairs=n=>n*(n-1)/2;
+function renderTrackers(){
+  const el=$('#s-trackers');el.innerHTML='';const P=S.config.people;
+  S.config.trackers.forEach((t,i)=>{
+    const c=card();
+    const nm=document.createElement('input');nm.placeholder='Name (leave blank to use the names)';nm.value=t.name||'';nm.oninput=()=>{t.name=nm.value;touch()};
+    const mem=document.createElement('div');mem.innerHTML='<div class="sub">People to track (2 or more)</div>';
+    const info=document.createElement('div');info.className='hint';
+    const upd=()=>{const n=t.members.length;info.textContent=n<2?'Pick at least 2 people.':`${n} people = ${nPairs(n)} pair${nPairs(n)>1?'s':''} tracked${n>2?' (every combination)':''}.`};
+    const chips=document.createElement('div');chips.className='chips';
+    P.forEach(p=>{
+      const l=document.createElement('label');l.className='chip';
+      const k=document.createElement('input');k.type='checkbox';k.checked=t.members.includes(p.id);
+      k.onchange=()=>{t.members=k.checked?[...t.members,p.id]:t.members.filter(x=>x!==p.id);touch();upd();renderLive(S.status)};
+      l.append(k,p.name||'(unnamed)');chips.append(l);
+    });
+    mem.append(chips,info);upd();
+    const md=selCtl(TMODES,t.mode||'max',v=>{t.mode=v;touch();renderLive(S.status)});
+    const pl=document.createElement('label');pl.className='chip';
+    const pk=document.createElement('input');pk.type='checkbox';pk.checked=!!t.pair_sensors;pk.onchange=()=>{t.pair_sensors=pk.checked;touch()};
+    pl.append(pk,'Also make a sensor for each pair');
+    const rm=document.createElement('button');rm.className='d';rm.textContent='Remove tracker';rm.onclick=()=>{S.config.trackers.splice(i,1);touch();renderTrackers();renderSeg();renderLive(S.status)};
+    c.append(nm,mem,md,pl,rm);el.append(c);
+  });
+  const add=document.createElement('button');add.className='p';add.textContent='+ Add tracker';
+  add.onclick=()=>{S.config.trackers.push({id:rid(),name:'',members:S.config.people.slice(0,2).map(p=>p.id),mode:'max',pair_sensors:false});touch();renderTrackers();renderSeg()};
+  el.append(add);
+  el.insertAdjacentHTML('beforeend','<div class="hint">A tracker shows how far people are from each other. Pick 2 people for one distance, or a whole group and every pair is tracked. You get a drive-time sensor and a distance sensor; the rule above decides which pair they show, and the attributes list every pair (road and straight-line distance). Turn on per-pair sensors for a separate sensor for each combination.</div>');
+}
 function fillAll(){
   for(const p of S.config.people)for(const d of S.config.destinations)
     if(!S.config.routes.some(r=>r.from===p.id&&r.to===d.id))S.config.routes.push({from:p.id,to:d.id});
@@ -1215,6 +1610,11 @@ function renderSettings(){
   inf.innerHTML=`<h2 style="margin-top:0">Connection</h2><div class="sub">MQTT broker: ${esc(S.info.mqtt)}<br>Log level: ${esc(S.info.log_level)}</div><div class="hint">Change these on the add-on's Configuration tab, then restart the add-on.</div>`;
   el.append(inf);
 }
+function renderFind(){
+  $('#fseg').innerHTML=[['quick','⚡ Address (fast)'],['ai','✨ AI search']].map(([k,l])=>`<button class="${fmode===k?'on':''}" onclick="setFind('${k}')">${l}</button>`).join('');
+  $('#q').placeholder=fmode==='quick'?'Address, business, or "lat, lon"':'e.g. closest Lowe\'s, Mario\'s Pizza downtown';
+}
+function setFind(k){fmode=k;SR=[];$('#sres').innerHTML='';renderFind()}
 function renderSearchOpts(){
   $('#near').innerHTML='<option value="home">Near Home</option>'+S.config.people.filter(p=>p.entity).map(p=>`<option value="${esc(p.id)}">Near ${esc(p.name||p.entity)} right now</option>`).join('');
   const el=$('#sopts');el.innerHTML='';
@@ -1226,35 +1626,102 @@ function renderSearchOpts(){
   if(!S.config.people.length)el.innerHTML='<span class="sub">Add people in Setup first</span>';
 }
 function dist(m){if(m==null)return'';const u=S.config.settings.units==='metric';return ' · '+(m/(u?1000:1609.344)).toFixed(1)+(u?' km':' mi')+' away'}
-async function doSearch(){
-  const q=$('#q').value.trim();if(!q)return;const out=$('#sres');
-  const ent=S.config.settings.ai_task_entity;
-  if(!ent){out.innerHTML='<div class="sub err">Pick an AI Task entity in Settings first.</div>';return}
-  out.innerHTML='<div class="sub">Searching… this can take up to a minute</div>';
-  const p=S.config.people.find(x=>x.id===$('#near').value);
+function nearEntity(){const p=S.config.people.find(x=>x.id===$('#near').value);return p?p.entity:'home'}
+/* fast search: parallel geocoders on the server; quick=true is the single-provider type-ahead */
+async function geoFetch(q,near,quick){
+  const r=await fetch('api/geosearch?q='+encodeURIComponent(q)+'&near='+encodeURIComponent(near||'home')+(quick?'&quick=1':''));
+  return r.json();
+}
+function listResults(out,list,onPick,label){
+  out.innerHTML='';
+  list.forEach(x=>{
+    const c=document.createElement('div');c.className='card live';
+    const src=x.source?`<span class="src">${esc(x.source)}</span>`:'';
+    c.innerHTML=`<div><b>${esc(x.name)}</b>${src}<div class="sub">${esc(x.address||'')}${dist(x.dist_m)}</div></div>`;
+    const b=document.createElement('button');b.className='p';b.textContent=label||'Add';b.onclick=()=>onPick(x,b);
+    c.append(b);out.append(c);
+  });
+}
+function noMatch(out,errs){
+  out.innerHTML='<div class="sub">No match. Try "street, city, state", add the city, or paste "lat, lon".</div>'+(errs&&errs.length?`<div class="hint err">${esc(errs.join(' | '))}</div>`:'');
+}
+async function quickSearch(q,quick){
+  const out=$('#sres'),seq=++qseq;
+  if(!quick)out.innerHTML='<div class="sub">Searching…</div>';
   try{
-    const j=await J('api/search',{query:q,entity:ent,near:p?p.entity:'home'});
+    const j=await geoFetch(q,nearEntity(),quick);if(seq!==qseq)return;
+    if(!j.results.length){if(!quick)noMatch(out,j.errors);return}
+    SR=j.results;listResults(out,SR,(x,b)=>addResult(x,b));
+  }catch(e){if(seq===qseq&&!quick)out.innerHTML='<div class="sub err">Search failed</div>'}
+}
+function typeahead(){
+  clearTimeout(qtimer);if(fmode!=='quick')return;
+  const q=$('#q').value.trim();if(q.length<4)return;
+  qtimer=setTimeout(()=>quickSearch(q,true),450);
+}
+async function doSearch(){
+  const q=$('#q').value.trim();if(!q)return;clearTimeout(qtimer);
+  if(fmode==='quick')return quickSearch(q,false);
+  const out=$('#sres'),ent=S.config.settings.ai_task_entity;
+  if(!ent){out.innerHTML='<div class="sub err">Pick an AI Task entity in Settings first, or use the fast Address search.</div>';return}
+  out.innerHTML='<div class="sub">Searching… this can take up to a minute</div>';
+  try{
+    const j=await J('api/search',{query:q,entity:ent,near:nearEntity()});
     if(j.error){out.innerHTML=`<div class="sub err">${esc(j.error)}</div>`;return}
-    SR=j.results;out.innerHTML='';
-    SR.forEach((x,i)=>{
-      const c=document.createElement('div');c.className='card live';
-      c.innerHTML=`<div><b>${esc(x.name)}</b><div class="sub">${esc(x.address)}${dist(x.dist_m)}</div></div>`;
-      const b=document.createElement('button');b.className='p';b.textContent='Add';b.onclick=()=>addResult(i,b);
-      c.append(b);out.append(c);
-    });
+    SR=j.results;listResults(out,SR,(x,b)=>addResult(x,b));
   }catch(e){out.innerHTML='<div class="sub err">Search failed</div>'}
 }
-function addResult(i,btn){
-  const x=SR[i],id=rid();
-  S.config.destinations.push({id,name:x.name.slice(0,40),target:`${x.lat}, ${x.lon}`});
+function addResult(x,btn){
+  const id=rid();
+  S.config.destinations.push({id,name:(x.name||'Place').slice(0,40),target:`${x.lat}, ${x.lon}`});
   S.config.people.forEach(p=>{if(p.id&&!OFF.has(p.id))S.config.routes.push({from:p.id,to:id})});
   btn.textContent='Added ✓';btn.disabled=true;touch();renderDests();renderRoutes();renderSeg();renderLive(S.status);toast('Added. Press Save to start tracking.');
+}
+/* address picker sheet (used by the 🔎 button on a place) */
+function openAddrSheet(onPick){
+  const b=$('#sheetbody');b.innerHTML='<h2 style="margin:0 0 8px">Search address</h2>';
+  const q=document.createElement('input');q.placeholder='Address, business, or "lat, lon"';q.autocomplete='off';q.enterkeyhint='search';
+  const out=document.createElement('div');out.style.marginTop='10px';
+  let seq=0,tm=null;
+  const run=async quick=>{
+    const v=q.value.trim();if(v.length<2)return;const my=++seq;
+    if(!quick)out.innerHTML='<div class="sub">Searching…</div>';
+    try{const j=await geoFetch(v,'home',quick);if(my!==seq)return;
+      if(!j.results.length){if(!quick)noMatch(out,j.errors);return}
+      listResults(out,j.results,x=>{closeSheet();onPick(x)},'Use');
+    }catch(e){if(my===seq&&!quick)out.innerHTML='<div class="sub err">Search failed</div>'}
+  };
+  q.oninput=()=>{clearTimeout(tm);if(q.value.trim().length>=4)tm=setTimeout(()=>run(true),450)};
+  q.onkeydown=e=>{if(e.key==='Enter'){clearTimeout(tm);run(false)}};
+  const go=document.createElement('button');go.className='p';go.textContent='Search';go.style.cssText='width:100%;margin-top:8px';go.onclick=()=>{clearTimeout(tm);run(false)};
+  const cl=document.createElement('button');cl.textContent='Cancel';cl.style.cssText='width:100%;margin-top:8px';cl.onclick=closeSheet;
+  b.append(q,go,out,cl);$('#sheet').classList.add('open');setTimeout(()=>q.focus(),50);
 }
 function ago(t){if(!t)return'never';const s=Math.round(Date.now()/1000-t);return s<90?s+'s ago':Math.round(s/60)+'m ago'}
 function renderLive(st){
   const by={};
   for(const r of S.config.routes){if(r.from&&r.to&&r.from!==r.to)(by[r.from]=by[r.from]||[]).push(r)}
   let out='';
+  const tl=S.config.trackers.filter(t=>t.members.length>1);
+  if(tl.length){
+    out+='<h2>Between people</h2>';
+    const ML={max:'farthest pair',min:'closest pair',avg:'average'};
+    for(const t of tl){
+      const x=st['t|'+t.id]||{};const u=x.unit||'';let big='…',sb='waiting for first calculation';
+      const names=t.name||t.members.map(nameOf).join(' & ');
+      if(x.minutes!=null){
+        big=x.together?'Together':Math.round(x.minutes)+' min';
+        const bits=[];if(x.distance!=null)bits.push(`${x.distance} ${u} by road`);if(x.straight_line!=null)bits.push(`${x.straight_line} ${u} straight`);
+        if(t.members.length>2)bits.push(ML[x.mode]||'');
+        sb=bits.join(' · ');
+      }else if(x.straight_line!=null)sb=`${x.straight_line} ${u} straight-line · waiting for drive time`;
+      let pr='';
+      if(t.members.length>2&&x.pairs){
+        pr='<div class="pairs">'+x.pairs.map(q=>`<div><b>${esc(q.a)} ↔ ${esc(q.b)}</b> ${q.minutes!=null?(q.arrived?'together':Math.round(q.minutes)+' min · '+q.distance+' '+esc(u)):(q.error?'<span class="err">'+esc(q.error)+'</span>':'…')}</div>`).join('')+'</div>';
+      }
+      out+=`<div class="card"><div class="live"><div><b>📏 ${esc(names)}</b><div class="sub">${sb}</div></div><div class="big">${big}</div></div>${pr}</div>`;
+    }
+  }
   const gl=S.config.groups.filter(g=>g.to&&g.members.length>1);
   if(gl.length){
     out+='<h2>Groups</h2>';
@@ -1277,7 +1744,7 @@ function renderLive(st){
       out+=`<div class="card live"><div><b>→ ${esc(nameOf(r.to))}</b><div class="sub">${sb}</div></div><div class="big">${big}</div></div>`;
     }
   }
-  $('#live').innerHTML=out||'<div class="card"><div class="sub">Nothing to show yet. Open <b>Setup</b> to add people, places and routes, then Save.</div></div>';
+  $('#live').innerHTML=out||'<div class="card"><div class="sub">Nothing to show yet. Open <b>Setup</b> to add people, places, routes and trackers, then Save.</div></div>';
 }
 async function save(){
   const r=await J('api/config',S.config);
