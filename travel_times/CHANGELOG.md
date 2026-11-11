@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0
+- Trackers: new Setup > Trackers tab. Pick 2 people to see how far apart they are, or pick a whole group and every pair is tracked (3 people = 3 pairs, 4 = 6, up to 8 people). Each tracker gets a drive-time sensor and a distance sensor; choose whether they report the farthest pair, the closest pair or the average. Attributes list every pair with road and straight-line distance, and which pair is closest/farthest. Optional: a separate sensor for each pair. Shows live under "Between people".
+- Fast address search (ported from the Zone Creator add-on): US Census, OpenStreetMap and Photon are asked at the same time and results show as soon as the first one answers (no more waiting on AI). New "Address (fast)" mode on the Find tab with search-as-you-type, distance from home or a person, and "lat, lon" paste support. AI search is still there as the second mode.
+- New 🔎 button on every place to search an address and fill in its coordinates.
+- Place addresses typed into Places are now geocoded in parallel with caching instead of one slow lookup at a time, and lookups are forced to IPv4 (fixes hangs on some Docker/HAOS networks).
+
 ## 1.3.1
 - All sensors now live under one "Travel Times" MQTT device (one list), named "<Person> to <Place>", instead of one device per person. Existing entities keep their ids and history.
 
