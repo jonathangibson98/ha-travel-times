@@ -34,6 +34,10 @@ try:
     from curl_cffi import requests as cffi_requests
 except Exception:  # falls back to plain requests (Waze will likely answer 403)
     cffi_requests = None
+try:
+    import websocket  # websocket-client: only used to ask Home Assistant who is an admin
+except Exception:
+    websocket = None
 from flask import Flask, Response, jsonify, request
 
 DATA = os.environ.get("TT_DATA", "/data")
@@ -138,6 +142,12 @@ def load_cfg():
     c.setdefault("destinations", [])
     c.setdefault("groups", [])
     c.setdefault("trackers", [])
+    for g in c["groups"]:  # v1.3: a group had one destination ("to"); now it can have several
+        if "destinations" not in g:
+            to = g.pop("to", None)
+            g["destinations"] = [to] if to else []
+            if to:
+                g["legacy"] = to  # that destination keeps its old sensor id
     if "routes" not in c:  # older versions tracked every person -> every destination
         c["routes"] = [{"from": p["id"], "to": d["id"]} for p in c["people"] for d in c["destinations"]]
     s = dict(DEFAULT_SETTINGS)
@@ -173,10 +183,11 @@ def all_pairs(c):
     people = {p["id"]: p for p in c["people"]}
     ends = endpoints_of(c)
     for g in c.get("groups", []):
-        d = ends.get(g.get("to"))
-        for m in g.get("members", []):
-            if d and m in people and m != d["id"]:
-                out.setdefault((m, d["id"]), (people[m], d))
+        for did in group_dests(g):
+            d = ends.get(did)
+            for m in g.get("members", []):
+                if d and m in people and m != d["id"]:
+                    out.setdefault((m, d["id"]), (people[m], d))
     for t in c.get("trackers", []):  # person <-> person: one Waze call per pair, reused if a route exists
         for a, b in tracker_pairs(t):
             if a in people and b in people and (a, b) not in out and (b, a) not in out:
@@ -468,45 +479,64 @@ def rate_ok(limit):
 
 
 # ------------------------------------------------------------- group sensors
-def group_disc_topic(gid):
-    return f"homeassistant/sensor/{BASE}_group_{gid}/config"
+# A group = several people + any number of destinations. One sensor per destination.
+def group_dests(g):
+    return g.get("destinations") or ([g["to"]] if g.get("to") else [])
+
+
+def group_key(g, did):
+    """Sensor key. The destination a v1.3 group already had keeps its original id."""
+    return g["id"] if did == g.get("legacy") else f"{g['id']}_{did}"
+
+
+def group_keys(c):
+    return {group_key(g, d) for g in c.get("groups", []) for d in group_dests(g)}
+
+
+def group_disc_topic(key):
+    return f"homeassistant/sensor/{BASE}_group_{key}/config"
 
 
 def publish_group_discovery(g, ends):
-    d = ends.get(g["to"])
-    if not d:
-        return
-    payload = {
-        "name": f"{g['name']} to {d['name']}",
-        "unique_id": f"{BASE}_group_{g['id']}",
-        "default_entity_id": f"sensor.{slug(g['name'])}_to_{slug(d['name'])}",
-        "state_topic": f"{BASE}/group/{g['id']}/state",
-        "json_attributes_topic": f"{BASE}/group/{g['id']}/attrs",
-        "availability_topic": STATUS_TOPIC,
-        "unit_of_measurement": "min",
-        "device_class": "duration",
-        "state_class": "measurement",
-        "icon": "mdi:account-group",
-        "device": DEVICE,
-    }
-    pub(group_disc_topic(g["id"]), json.dumps(payload))
+    for did in group_dests(g):
+        d = ends.get(did)
+        if not d:
+            continue
+        key = group_key(g, did)
+        payload = {
+            "name": f"{g['name']} to {d['name']}",
+            "unique_id": f"{BASE}_group_{key}",
+            "default_entity_id": f"sensor.{slug(g['name'])}_to_{slug(d['name'])}",
+            "state_topic": f"{BASE}/group/{key}/state",
+            "json_attributes_topic": f"{BASE}/group/{key}/attrs",
+            "availability_topic": STATUS_TOPIC,
+            "unit_of_measurement": "min",
+            "device_class": "duration",
+            "state_class": "measurement",
+            "icon": "mdi:account-group",
+            "device": DEVICE,
+        }
+        pub(group_disc_topic(key), json.dumps(payload))
 
 
-def group_state(c, g, snap):
-    """(minutes, attrs) for a group, or None until every member has a result."""
+def group_state(c, g, did, snap):
+    """(minutes, attrs) for a group going to one destination, or None until every member has a result."""
     people = {p["id"]: p for p in c["people"]}
-    ends = endpoints_of(c)
-    d = ends.get(g["to"])
+    d = endpoints_of(c).get(did)
     if not d:
         return None
     members, unit = [], None
     for m in g["members"]:
-        st = snap.get(f"{m}|{g['to']}", {})
-        if m not in people or st.get("minutes") is None:
+        if m == did or m not in people:  # someone can't travel to themselves
+            continue
+        st = snap.get(f"{m}|{did}", {})
+        if st.get("minutes") is None:
             return None
         unit = st.get("unit") or unit
         members.append({"name": people[m]["name"], "minutes": st["minutes"],
                         "distance": st.get("distance") or 0, "arrived": bool(st.get("arrived"))})
+    if not members:
+        return None
     mins = [x["minutes"] for x in members]
     mode = g.get("mode", "max")
     minutes = round({"max": max(mins), "min": min(mins), "sum": sum(mins)}[mode], 1)
@@ -529,20 +559,22 @@ def publish_groups():
         c = json.loads(json.dumps(cfg))
         snap = {k: dict(v) for k, v in status.items()}
     for g in c.get("groups", []):
-        res = group_state(c, g, snap)
-        if not res:
-            continue
-        minutes, attrs = res
-        key = json.dumps([minutes, attrs["members"], attrs["mode"]])
-        with lock:
-            group_live[g["id"]] = {"minutes": minutes, "unit": attrs["distance_unit"], "t": time.time(),
+        for did in group_dests(g):
+            res = group_state(c, g, did, snap)
+            if not res:
+                continue
+            key = group_key(g, did)
+            minutes, attrs = res
+            ckey = json.dumps([minutes, attrs["members"], attrs["mode"]])
+            with lock:
+                group_live[key] = {"minutes": minutes, "unit": attrs["distance_unit"], "t": time.time(),
                                    "members": attrs["members"], "total_distance": attrs["total_distance"],
                                    "arrived": attrs["arrived"], "mode": attrs["mode"], "error": None}
-            if group_cache.get(g["id"]) == key:
-                continue
-            group_cache[g["id"]] = key
-        pub(f"{BASE}/group/{g['id']}/state", str(minutes))
-        pub(f"{BASE}/group/{g['id']}/attrs", json.dumps(attrs))
+                if group_cache.get(key) == ckey:
+                    continue
+                group_cache[key] = ckey
+            pub(f"{BASE}/group/{key}/state", str(minutes))
+            pub(f"{BASE}/group/{key}/attrs", json.dumps(attrs))
 
 
 # ------------------------------------------------------------ tracker sensors
@@ -1025,15 +1057,27 @@ def clean_cfg(body):
     groups = []
     for g in (body.get("groups") or [])[:20]:
         name = str(g.get("name", "")).strip()[:40]
-        to = idmap.get(str(g.get("to")))
+        raw = g.get("destinations")
+        if raw is None:  # old backups / v1.3 groups had a single "to"
+            raw = [g.get("to")] if g.get("to") else []
+        dl = []
+        for x in raw:
+            x = idmap.get(str(x))
+            if x in valid_to and x not in dl:
+                dl.append(x)
+        dl = dl[:10]
         members = []
         for m in g.get("members") or []:
             m = idmap.get(str(m))
-            if m in person_ids and m != to and m not in members:
+            if m in person_ids and m not in members:
                 members.append(m)
-        if name and to in valid_to and len(members) >= 2:
-            groups.append({"id": new_id(g.get("id")), "name": name, "members": members[:8], "to": to,
-                           "mode": g.get("mode") if g.get("mode") in ("max", "min", "sum") else "max"})
+        if name and dl and len(members) >= 2:
+            ng = {"id": new_id(g.get("id")), "name": name, "members": members[:8], "destinations": dl,
+                  "mode": g.get("mode") if g.get("mode") in ("max", "min", "sum") else "max"}
+            legacy = idmap.get(str(g.get("legacy") or (g.get("to") if g.get("destinations") is None else None)))
+            if legacy in dl:
+                ng["legacy"] = legacy
+            groups.append(ng)
 
     trackers, pname = [], {p["id"]: p["name"] for p in people}
     for t in (body.get("trackers") or [])[:20]:
@@ -1088,11 +1132,10 @@ def apply_cfg(new):
                     st = status.get(f"{key[0]}|{key[1]}", {})
                     st.pop("t", None)
                     st.pop("arrived", None)
-        gone = {g["id"] for g in old.get("groups", [])} - {g["id"] for g in new.get("groups", [])}
-        for gid in gone:
-            pub(group_disc_topic(gid), "")
-            group_cache.pop(gid, None)
-            group_live.pop(gid, None)
+        for key in group_keys(old) - group_keys(new):  # group, or one of its destinations, removed
+            pub(group_disc_topic(key), "")
+            group_cache.pop(key, None)
+            group_live.pop(key, None)
         for topic in tracker_topics(old) - tracker_topics(new):
             pub(topic, "")  # tracker removed, or its per-pair sensors switched off / members changed
         for tid in {t["id"] for t in old.get("trackers", [])} - {t["id"] for t in new.get("trackers", [])}:
@@ -1176,8 +1219,81 @@ def find_places(query, entity, near):
     return out
 
 
+# ------------------------------------------------------------ who is an admin?
+# Ingress tells us WHICH Home Assistant user opened the page (X-Remote-User-* headers). Whether that
+# user is an admin comes from HA's own user list. Admins get every menu; everyone else gets Live only.
+# This is enforced here on the server, not just hidden in the page, so a viewer can't call the API.
+ADMIN_TTL = 60
+_admin = {"t": 0.0, "users": None}
+
+
+def ha_user_list():
+    """All HA users (id, username, name, is_owner, group_ids) via the websocket API."""
+    if websocket is None:
+        raise RuntimeError("websocket-client is not installed")
+    ws = websocket.create_connection(os.environ.get("TT_WS", "ws://supervisor/core/websocket"), timeout=8)
+    try:
+        ws.recv()  # auth_required
+        ws.send(json.dumps({"type": "auth", "access_token": TOKEN}))
+        if json.loads(ws.recv()).get("type") != "auth_ok":
+            raise RuntimeError("Home Assistant refused the add-on token")
+        ws.send(json.dumps({"id": 1, "type": "config/auth/list"}))
+        while True:
+            m = json.loads(ws.recv())
+            if m.get("id") == 1:
+                if not m.get("success"):
+                    raise RuntimeError(str(m.get("error"))[:100])
+                return m.get("result") or []
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def admin_users():
+    """{lowercase id / username / name -> True} for every active admin. Cached for a minute;
+    if HA can't be asked, the last good answer is kept (and with none, nobody counts as admin)."""
+    now = time.time()
+    if _admin["users"] is not None and now - _admin["t"] < ADMIN_TTL:
+        return _admin["users"]
+    try:
+        keys = set()
+        for u in ha_user_list():
+            if u.get("is_active", True) and not u.get("system_generated") and (
+                    u.get("is_owner") or "system-admin" in (u.get("group_ids") or [])):
+                keys.update(str(u[k]).lower() for k in ("id", "username", "name") if u.get(k))
+        _admin.update(t=now, users=keys)
+    except Exception as e:
+        log.warning("Could not check admin users (%s). Viewers keep Live only.", e)
+        _admin["t"] = now - ADMIN_TTL + 10  # retry in 10 s
+        if _admin["users"] is None:
+            _admin["users"] = set()
+    return _admin["users"]
+
+
+def is_admin():
+    h = request.headers
+    ident = [h.get(k) for k in ("X-Remote-User-Id", "X-Remote-User-Name", "X-Remote-User")]
+    ident = [str(x).strip().lower() for x in ident if x and str(x).strip()]
+    if not ident:
+        return False  # no user attached to the request: fail closed
+    admins = admin_users()
+    return any(i in admins for i in ident)
+
+
 # ------------------------------------------------------------------ Flask UI
 app = Flask(__name__)
+VIEWER_OK = {"/", "/api/config", "/api/status"}
+
+
+@app.before_request
+def admin_gate():
+    if request.method == "GET" and request.path in VIEWER_OK:
+        return None
+    if is_admin():
+        return None
+    return jsonify(error="Admin access required"), 403
 
 
 @app.after_request
@@ -1202,14 +1318,29 @@ def index():
     return Response(PAGE, mimetype="text/html")
 
 
+def viewer_config(c):
+    """What a non-admin may see on the Live page: names and structure only. No entity ids, addresses,
+    coordinates or settings."""
+    names = lambda L: [{"id": x["id"], "name": x["name"]} for x in L]
+    return {"people": names(c["people"]), "destinations": names(c["destinations"]),
+            "routes": c["routes"], "groups": c["groups"],
+            "trackers": [{k: t[k] for k in ("id", "name", "members", "mode")} for t in c["trackers"]],
+            "settings": {"units": c["settings"]["units"]}}
+
+
 @app.get("/api/config")
 def api_get():
+    if not is_admin():
+        with lock:
+            c = viewer_config(json.loads(json.dumps(cfg)))
+        return jsonify(config=c, status=status_public(), trackers=[], zones=[], ai_tasks=[],
+                       info={}, admin=False)
     trackers, zones, ais = list_entities()
     with lock:
         c = json.loads(json.dumps(cfg))
     mq_host = (OPTIONS.get("mqtt_host") or "").strip()
     info = {"mqtt": mq_host or "Mosquitto (automatic)", "log_level": str(OPTIONS.get("log_level", "info"))}
-    return jsonify(config=c, status=status_public(), trackers=trackers, zones=zones, ai_tasks=ais, info=info)
+    return jsonify(config=c, status=status_public(), trackers=trackers, zones=zones, ai_tasks=ais, info=info, admin=True)
 
 
 @app.get("/api/status")
@@ -1392,6 +1523,21 @@ label.l{display:block;font-size:13px;color:var(--mu);margin-bottom:4px}
 .seg{display:flex;background:#12121f;border:1px solid var(--line);border-radius:12px;padding:3px;margin-bottom:12px;overflow-x:auto;scrollbar-width:none}
 .seg button{flex:1 0 auto;border:0;background:transparent;min-height:40px;padding:6px 10px;font-size:14px;white-space:nowrap}.seg button.on{background:var(--ac);color:#04121c;font-weight:700}
 .pairs{margin-top:6px;font-size:13px;color:var(--mu);line-height:1.5}.pairs b{color:var(--tx);font-weight:600}
+details.acc{background:var(--card);border:1px solid var(--line);border-radius:14px;margin-bottom:8px}
+details.acc>summary{list-style:none;display:flex;align-items:center;gap:10px;padding:0 14px;min-height:52px;cursor:pointer}
+details.acc>summary::-webkit-details-marker{display:none}
+details.acc>summary::after{content:'›';color:var(--mu);font-size:20px;transition:transform .15s}
+details.acc[open]>summary::after{transform:rotate(90deg)}
+details.acc[open]>summary{border-bottom:1px solid var(--line)}
+.at{font-weight:600;white-space:nowrap}.as{color:var(--mu);font-size:13px;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+details.acc>.body{padding:14px}
+.acc .field{margin:0 0 14px}.acc .field:last-child{margin:0}
+.tg{min-height:38px;border-radius:20px;padding:4px 14px;font-size:14px;background:#12121f;color:var(--mu)}
+.tg.on{background:#0b3a52;border-color:var(--ac);color:var(--tx)}
+.pname{display:flex;flex-direction:column;align-items:flex-start;text-align:left;gap:2px;flex:1;min-height:52px;background:#0b3a52;border-color:var(--ac)}
+.pname b{font-size:17px}
+.sublab{font-size:12px;color:var(--mu);margin:12px 0 2px}
+.viewer main{padding-bottom:24px}
 .src{font-size:11px;color:var(--mu);border:1px solid var(--line);border-radius:8px;padding:1px 6px;margin-left:6px;white-space:nowrap}
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
 .chip{display:flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--line);border-radius:20px;font-size:14px}
@@ -1405,7 +1551,7 @@ label.l{display:block;font-size:13px;color:var(--mu);margin-bottom:4px}
 .item{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:12px 4px;border-bottom:1px solid var(--line);cursor:pointer;word-break:break-word}
 @media(min-width:700px){main{max-width:640px;margin:0 auto}}
 </style></head><body>
-<div class="top"><h1 id="title">Live</h1><button class="ico" onclick="refreshNow()" aria-label="Refresh">⟳</button></div>
+<div class="top"><h1 id="title">Live</h1><button id="refbtn" class="ico" onclick="refreshNow()" aria-label="Refresh">⟳</button></div>
 <main>
 <section id="p-live" class="pg"><div id="live"><div class="sub">Loading…</div></div></section>
 <section id="p-setup" class="pg hid">
@@ -1442,6 +1588,7 @@ function touch(){dirty=true;$('#savebar').classList.remove('hid')}
 const PAGES=[['live','🏠','Live'],['setup','🧭','Setup'],['find','🔎','Find'],['settings','⚙️','Settings'],['backup','💾','Backup']];
 $('#nav').innerHTML=PAGES.map(([k,i,l])=>`<button id="n-${k}" onclick="go('${k}')"><span>${i}</span>${l}</button>`).join('');
 function go(k){
+  if(S&&!S.admin)k='live';
   page=k;try{sessionStorage.setItem('tt_page',k)}catch(e){}
   PAGES.forEach(([x,,l])=>{$('#p-'+x).classList.toggle('hid',x!==k);$('#n-'+x).classList.toggle('on',x===k);if(x===k)$('#title').textContent=l});
   if(k==='backup')loadBackups();window.scrollTo(0,0);
@@ -1451,11 +1598,19 @@ async function load(){
   $('#dl').innerHTML=[...S.zones,...S.trackers].map(o=>`<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
   dirty=false;$('#savebar').classList.add('hid');renderAll();
 }
-function renderAll(){renderSeg();renderPeople();renderDests();renderRoutes();renderGroups();renderTrackers();renderFind();renderSearchOpts();renderSettings();renderBackup();renderLive(S.status)}
+/* viewers (non-admin HA users) only get the Live page; the server enforces it too */
+function applyRole(){
+  const a=!!S.admin;
+  $('#nav').classList.toggle('hid',!a);$('#refbtn').classList.toggle('hid',!a);document.body.classList.toggle('viewer',!a);
+  if(!a){$('#savebar').classList.add('hid');go('live');$('#title').textContent='Travel Times'}
+}
+function renderAll(){
+  applyRole();if(!S.admin){renderLive(S.status);return}
+  renderSeg();renderPeople();renderDests();renderRoutes();renderGroups();renderTrackers();renderFind();renderSearchOpts();renderSettings();renderBackup();renderLive(S.status)}
 function dropRoutes(id){
   S.config.routes=S.config.routes.filter(r=>r.from!==id&&r.to!==id);
-  S.config.groups.forEach(g=>{g.members=g.members.filter(m=>m!==id)});
-  S.config.groups=S.config.groups.filter(g=>g.to!==id&&g.members.length>=2);
+  S.config.groups.forEach(g=>{g.members=g.members.filter(m=>m!==id);g.destinations=(g.destinations||[]).filter(x=>x!==id)});
+  S.config.groups=S.config.groups.filter(g=>g.destinations.length>=1&&g.members.length>=2);
   S.config.trackers.forEach(t=>{t.members=t.members.filter(m=>m!==id)});
   S.config.trackers=S.config.trackers.filter(t=>t.members.length>=2);
 }
@@ -1467,111 +1622,136 @@ function renderSeg(){
 }
 function setSub(k){sub=k;renderSeg()}
 function card(){const c=document.createElement('div');c.className='card stack';return c}
+const OPEN=new Set();
+const gkey=(g,d)=>d===g.legacy?g.id:g.id+'_'+d;
+function body(){const b=document.createElement('div');b.className='stack';return b}
+function acc(key,title,sub,bd){
+  const d=document.createElement('details');d.className='acc';d.open=OPEN.has(key);
+  d.addEventListener('toggle',()=>{d.open?OPEN.add(key):OPEN.delete(key)});
+  const s=document.createElement('summary'),t=document.createElement('span'),u=document.createElement('span');
+  t.className='at';t.textContent=title;u.className='as';u.textContent=sub||'';s.append(t,u);
+  bd.classList.add('body');d.append(s,bd);d.setT=(a,b)=>{t.textContent=a;u.textContent=b||''};return d;
+}
+function tgl(label,on,fn){const b=document.createElement('button');b.type='button';b.className='tg'+(on?' on':'');b.textContent=label;b.onclick=fn;return b}
+function lab(t){const d=document.createElement('div');d.className='sublab';d.textContent=t;return d}
+function chipset(items,arr,after){
+  const w=document.createElement('div');w.className='chips';w.style.margin='6px 0 0';
+  items.forEach(([id,label])=>{
+    const b=tgl(label,arr.includes(id),()=>{const k=arr.indexOf(id);k<0?arr.push(id):arr.splice(k,1);b.classList.toggle('on',k<0);touch();after&&after()});
+    w.append(b);
+  });
+  if(!items.length)w.innerHTML='<span class="sub">Nothing to pick yet</span>';
+  return w;
+}
+const pItems=()=>S.config.people.map(p=>[p.id,'👤 '+(p.name||'(unnamed)')]);
+const dItems=()=>S.config.destinations.map(d=>[d.id,'📍 '+(d.name||'(unnamed)')]);
+function addBtn(text,fn){const b=document.createElement('button');b.className='p';b.textContent=text;b.onclick=fn;b.style.width='100%';return b}
+function hint(el,t){el.insertAdjacentHTML('beforeend',`<div class="hint" style="margin:6px 4px 0">${t}</div>`)}
+function refreshLists(){renderRoutes();renderGroups();renderTrackers();renderSearchOpts();renderLive(S.status);renderSeg()}
 function renderPeople(){
   const el=$('#s-people');el.innerHTML='';
   S.config.people.forEach((p,i)=>{
-    const c=card();
-    const nm=document.createElement('input');nm.placeholder='Name (Jon)';nm.value=p.name||'';nm.oninput=()=>{p.name=nm.value;touch();renderRoutes();renderLive(S.status);renderSearchOpts()};
+    const b=body(),sub=()=>p.entity||'pick a location source',ttl=()=>p.name||'New person';
+    const nm=document.createElement('input');nm.placeholder='Name (Jon)';nm.value=p.name||'';
     const sel=document.createElement('select');
     const opts=[...S.trackers];if(p.entity&&!opts.find(o=>o.id===p.entity))opts.unshift({id:p.entity,name:p.entity});
     sel.innerHTML='<option value="">Pick a location source…</option>'+opts.map(o=>`<option value="${esc(o.id)}">${esc(o.name)} (${esc(o.id)})</option>`).join('');
-    sel.value=p.entity||'';sel.onchange=()=>{p.entity=sel.value;touch();renderSearchOpts()};
+    sel.value=p.entity||'';
     const rm=document.createElement('button');rm.className='d';rm.textContent='Remove person';rm.onclick=()=>{dropRoutes(p.id);S.config.people.splice(i,1);touch();renderAll()};
-    c.append(nm,sel,rm);el.append(c);
+    b.append(lab('Name'),nm,lab('Location source'),sel,rm);
+    const a=acc('p'+p.id,ttl(),sub(),b);
+    nm.oninput=()=>{p.name=nm.value;a.setT(ttl(),sub());touch();refreshLists()};
+    sel.onchange=()=>{p.entity=sel.value;a.setT(ttl(),sub());touch();renderSearchOpts()};
+    el.append(a);
   });
-  const add=document.createElement('button');add.className='p';add.textContent='+ Add person';add.onclick=()=>{S.config.people.push({id:rid(),name:'',entity:''});touch();renderAll()};
-  el.append(add);
+  el.append(addBtn('+ Add person',()=>{const id=rid();S.config.people.push({id,name:'',entity:''});OPEN.add('p'+id);touch();renderAll()}));
 }
 function renderDests(){
   const el=$('#s-places');el.innerHTML='';
   S.config.destinations.forEach((d,i)=>{
-    const c=card();
-    const nm=document.createElement('input');nm.placeholder='Name (Work)';nm.value=d.name||'';nm.oninput=()=>{d.name=nm.value;touch();renderRoutes();renderLive(S.status)};
-    const tg=document.createElement('input');tg.placeholder='zone.work, 34.5,-82.6, or address';tg.setAttribute('list','dl');tg.value=d.target||'';tg.oninput=()=>{d.target=tg.value;touch()};
+    const b=body(),ttl=()=>d.name||'New place';
+    const nm=document.createElement('input');nm.placeholder='Name (Work)';nm.value=d.name||'';
+    const tg=document.createElement('input');tg.placeholder='zone.work, 34.5,-82.6, or address';tg.setAttribute('list','dl');tg.value=d.target||'';
     const sb=document.createElement('button');sb.className='ico';sb.textContent='🔎';sb.setAttribute('aria-label','Search address');
-    sb.onclick=()=>openAddrSheet(x=>{d.target=`${x.lat}, ${x.lon}`;if(!(d.name||'').trim())d.name=(x.name||'').slice(0,40);touch();renderDests();renderRoutes();renderLive(S.status)});
+    sb.onclick=()=>openAddrSheet(x=>{d.target=`${x.lat}, ${x.lon}`;if(!(d.name||'').trim())d.name=(x.name||'').slice(0,40);OPEN.add('d'+d.id);touch();renderDests();refreshLists()});
     const row=document.createElement('div');row.className='hrow';row.append(tg,sb);
     const rm=document.createElement('button');rm.className='d';rm.textContent='Remove place';rm.onclick=()=>{dropRoutes(d.id);S.config.destinations.splice(i,1);touch();renderAll()};
-    c.append(nm,row,rm);el.append(c);
+    b.append(lab('Name'),nm,lab('Where is it? Zone, address or "lat, lon"'),row,rm);
+    const a=acc('d'+d.id,ttl(),d.target||'no location yet',b);
+    nm.oninput=()=>{d.name=nm.value;a.setT(ttl(),d.target||'');touch();refreshLists()};
+    tg.oninput=()=>{d.target=tg.value;a.setT(ttl(),d.target||'');touch()};
+    el.append(a);
   });
-  const add=document.createElement('button');add.className='p';add.textContent='+ Add place';add.onclick=()=>{S.config.destinations.push({id:rid(),name:'',target:''});touch();renderAll()};
-  el.append(add);el.insertAdjacentHTML('beforeend','<div class="hint">A place can be a zone, "lat, lon", or a street address. Tap 🔎 to search an address, or use the Find tab.</div>');
+  el.append(addBtn('+ Add place',()=>{const id=rid();S.config.destinations.push({id,name:'',target:''});OPEN.add('d'+id);touch();renderAll()}));
+  hint(el,'Tap 🔎 to search an address, or use the Find tab.');
 }
 function renderRoutes(){
   const el=$('#s-routes');el.innerHTML='';
-  const P=S.config.people,D=S.config.destinations;
-  const po=P.map(p=>`<option value="${esc(p.id)}">${esc(p.name||'(unnamed)')}</option>`).join('');
-  const dopt=D.map(d=>`<option value="${esc(d.id)}">${esc(d.name||'(unnamed)')}</option>`).join('');
-  S.config.routes.forEach((r,i)=>{
-    const c=card();
-    const f=document.createElement('select');f.innerHTML='<option value="">From…</option>'+po;f.value=r.from||'';f.onchange=()=>{r.from=f.value;touch();renderLive(S.status)};
-    const t=document.createElement('select');
-    t.innerHTML='<option value="">To…</option>'+(D.length?`<optgroup label="Places">${dopt}</optgroup>`:'')+(P.length?`<optgroup label="People (live)">${po}</optgroup>`:'');
-    t.value=r.to||'';t.onchange=()=>{r.to=t.value;touch();renderLive(S.status)};
-    const rm=document.createElement('button');rm.className='d';rm.textContent='Remove route';rm.onclick=()=>{S.config.routes.splice(i,1);touch();renderRoutes();renderSeg();renderLive(S.status)};
-    c.append(f,t,rm);el.append(c);
+  const P=S.config.people,D=S.config.destinations,R=()=>S.config.routes;
+  if(!P.length){hint(el,'Add people first (Setup › People).');return}
+  const top=document.createElement('button');top.textContent='Everyone → all places';top.onclick=fillAll;top.style.cssText='width:100%;margin-bottom:10px';
+  if(D.length)el.append(top);
+  P.forEach(p=>{
+    const has=id=>R().some(r=>r.from===p.id&&r.to===id),mine=()=>R().filter(r=>r.from===p.id).length;
+    const c=document.createElement('div');c.className='card';
+    const head=document.createElement('div');head.className='hrow';
+    const nb=document.createElement('button');nb.className='pname';
+    nb.innerHTML=`<b>${esc(p.name||'(unnamed)')}</b><span class="sub">Tap to track all places · ${mine()} route${mine()===1?'':'s'}</span>`;
+    nb.onclick=()=>{
+      let n=0;D.forEach(d=>{if(!has(d.id)){R().push({from:p.id,to:d.id});n++}});
+      touch();renderRoutes();renderSeg();renderLive(S.status);
+      toast(!D.length?'Add places first':n?`Added ${n} route${n>1?'s':''} for ${p.name||'this person'}`:'Already tracking every place');
+    };
+    head.append(nb);
+    if(mine()){const clr=document.createElement('button');clr.className='d';clr.textContent='Clear';clr.onclick=()=>{S.config.routes=R().filter(r=>r.from!==p.id);touch();renderRoutes();renderSeg();renderLive(S.status)};head.append(clr)}
+    c.append(head);
+    const flip=id=>()=>{if(has(id))S.config.routes=R().filter(r=>!(r.from===p.id&&r.to===id));else R().push({from:p.id,to:id});touch();renderRoutes();renderSeg();renderLive(S.status)};
+    if(D.length){c.append(lab('Places'));const w=document.createElement('div');w.className='chips';w.style.margin='6px 0 0';D.forEach(d=>w.append(tgl('📍 '+(d.name||'(unnamed)'),has(d.id),flip(d.id))));c.append(w)}
+    const others=P.filter(o=>o.id!==p.id);
+    if(others.length){c.append(lab('Follow a person live'));const w=document.createElement('div');w.className='chips';w.style.margin='6px 0 0';others.forEach(o=>w.append(tgl('👤 '+(o.name||'(unnamed)'),has(o.id),flip(o.id))));c.append(w)}
+    el.append(c);
   });
-  const add=document.createElement('button');add.className='p';add.textContent='+ Add route';add.onclick=()=>{S.config.routes.push({from:'',to:''});touch();renderRoutes();renderSeg()};
-  const fill=document.createElement('button');fill.textContent='Everyone → all places';fill.onclick=fillAll;
-  const w=document.createElement('div');w.className='stack';w.append(add,fill);el.append(w);
-  el.insertAdjacentHTML('beforeend','<div class="hint">Each route is one sensor. Pick a person as the "To" to track person to person.</div>');
+  hint(el,'Each highlighted chip is one sensor. Tap a name to track every place for that person, tap a chip to turn one on or off.');
 }
 const MODES=[['max','Longest: when everyone has arrived'],['min','Shortest: first one there'],['sum','Combined total of everyone']];
 function renderGroups(){
   const el=$('#s-groups');el.innerHTML='';
-  const P=S.config.people,D=S.config.destinations;
-  const dopt=(D.length?`<optgroup label="Places">${D.map(d=>`<option value="${esc(d.id)}">${esc(d.name||'(unnamed)')}</option>`).join('')}</optgroup>`:'')+(P.length?`<optgroup label="People (live)">${P.map(p=>`<option value="${esc(p.id)}">${esc(p.name||'(unnamed)')}</option>`).join('')}</optgroup>`:'');
   S.config.groups.forEach((g,i)=>{
-    const c=card();
-    const nm=document.createElement('input');nm.placeholder='Group name (Jon & Sam)';nm.value=g.name||'';nm.oninput=()=>{g.name=nm.value;touch();renderLive(S.status)};
-    const mem=document.createElement('div');mem.innerHTML='<div class="sub">People in this group (2 or more)</div>';
-    const chips=document.createElement('div');chips.className='chips';
-    P.forEach(p=>{
-      const l=document.createElement('label');l.className='chip';
-      const k=document.createElement('input');k.type='checkbox';k.checked=g.members.includes(p.id);
-      k.onchange=()=>{g.members=k.checked?[...g.members,p.id]:g.members.filter(x=>x!==p.id);touch()};
-      l.append(k,p.name||'(unnamed)');chips.append(l);
-    });
-    mem.append(chips);
-    const to=document.createElement('select');to.innerHTML='<option value="">To…</option>'+dopt;to.value=g.to||'';to.onchange=()=>{g.to=to.value;touch();renderLive(S.status)};
+    g.destinations=g.destinations||[];
+    const b=body(),ttl=()=>g.name||'New group';
+    const sub=()=>`${g.members.length} people → ${g.destinations.length} place${g.destinations.length===1?'':'s'}`;
+    const nm=document.createElement('input');nm.placeholder='Group name (Jon & Sam)';nm.value=g.name||'';
     const md=selCtl(MODES,g.mode||'max',v=>{g.mode=v;touch()});
     const rm=document.createElement('button');rm.className='d';rm.textContent='Remove group';rm.onclick=()=>{S.config.groups.splice(i,1);touch();renderGroups();renderSeg();renderLive(S.status)};
-    c.append(nm,mem,to,md,rm);el.append(c);
+    const a=acc('g'+g.id,ttl(),sub(),b);
+    const after=()=>{a.setT(ttl(),sub());renderLive(S.status)};
+    b.append(lab('Name'),nm,lab('People (2 or more)'),chipset(pItems(),g.members,after),
+      lab('Where to: pick as many as you like, one sensor each'),chipset([...dItems(),...pItems().map(([id,l])=>[id,l+' (live)'])],g.destinations,after),
+      lab('Sensor shows'),md,rm);
+    nm.oninput=()=>{g.name=nm.value;a.setT(ttl(),sub());touch();renderLive(S.status)};
+    el.append(a);
   });
-  const add=document.createElement('button');add.className='p';add.textContent='+ Add group';
-  add.onclick=()=>{S.config.groups.push({id:rid(),name:'',members:S.config.people.slice(0,2).map(p=>p.id),to:'',mode:'max'});touch();renderGroups();renderSeg()};
-  el.append(add);
-  el.insertAdjacentHTML('beforeend','<div class="hint">A group is one sensor for several people going to the same place, e.g. you and your partner heading home. The sensor shows the time by the rule you pick, and its attributes list each person plus the combined total time and distance.</div>');
+  el.append(addBtn('+ Add group',()=>{const id=rid();S.config.groups.push({id,name:'',members:S.config.people.slice(0,2).map(p=>p.id),destinations:[],mode:'max'});OPEN.add('g'+id);touch();renderGroups();renderSeg()}));
+  hint(el,'One group can go to several places: every place you pick gets its own sensor (for example "Family to Home" and "Family to Airport"), so there is no need to make the group twice.');
 }
 const TMODES=[['max','Show farthest pair'],['min','Show closest pair'],['avg','Show average of pairs']];
 const nPairs=n=>n*(n-1)/2;
 function renderTrackers(){
-  const el=$('#s-trackers');el.innerHTML='';const P=S.config.people;
+  const el=$('#s-trackers');el.innerHTML='';
   S.config.trackers.forEach((t,i)=>{
-    const c=card();
-    const nm=document.createElement('input');nm.placeholder='Name (leave blank to use the names)';nm.value=t.name||'';nm.oninput=()=>{t.name=nm.value;touch()};
-    const mem=document.createElement('div');mem.innerHTML='<div class="sub">People to track (2 or more)</div>';
-    const info=document.createElement('div');info.className='hint';
-    const upd=()=>{const n=t.members.length;info.textContent=n<2?'Pick at least 2 people.':`${n} people = ${nPairs(n)} pair${nPairs(n)>1?'s':''} tracked${n>2?' (every combination)':''}.`};
-    const chips=document.createElement('div');chips.className='chips';
-    P.forEach(p=>{
-      const l=document.createElement('label');l.className='chip';
-      const k=document.createElement('input');k.type='checkbox';k.checked=t.members.includes(p.id);
-      k.onchange=()=>{t.members=k.checked?[...t.members,p.id]:t.members.filter(x=>x!==p.id);touch();upd();renderLive(S.status)};
-      l.append(k,p.name||'(unnamed)');chips.append(l);
-    });
-    mem.append(chips,info);upd();
+    const b=body(),ttl=()=>t.name||(t.members.map(nameOf).join(' & ')||'New tracker');
+    const sub=()=>{const n=t.members.length;return n<2?'pick 2+ people':`${n} people · ${nPairs(n)} pair${nPairs(n)>1?'s':''}`};
+    const nm=document.createElement('input');nm.placeholder='Name (blank = use the names)';nm.value=t.name||'';
     const md=selCtl(TMODES,t.mode||'max',v=>{t.mode=v;touch();renderLive(S.status)});
-    const pl=document.createElement('label');pl.className='chip';
-    const pk=document.createElement('input');pk.type='checkbox';pk.checked=!!t.pair_sensors;pk.onchange=()=>{t.pair_sensors=pk.checked;touch()};
-    pl.append(pk,'Also make a sensor for each pair');
+    const pairs=tgl('Also make a sensor for each pair',!!t.pair_sensors,()=>{t.pair_sensors=!t.pair_sensors;pairs.classList.toggle('on',t.pair_sensors);touch()});
     const rm=document.createElement('button');rm.className='d';rm.textContent='Remove tracker';rm.onclick=()=>{S.config.trackers.splice(i,1);touch();renderTrackers();renderSeg();renderLive(S.status)};
-    c.append(nm,mem,md,pl,rm);el.append(c);
+    const a=acc('t'+t.id,ttl(),sub(),b);
+    b.append(lab('Name'),nm,lab('People to track (2 or more, every pair is tracked)'),chipset(pItems(),t.members,()=>{a.setT(ttl(),sub());renderLive(S.status)}),lab('Sensors report'),md,lab('Extras'),pairs,rm);
+    nm.oninput=()=>{t.name=nm.value;a.setT(ttl(),sub());touch();renderLive(S.status)};
+    el.append(a);
   });
-  const add=document.createElement('button');add.className='p';add.textContent='+ Add tracker';
-  add.onclick=()=>{S.config.trackers.push({id:rid(),name:'',members:S.config.people.slice(0,2).map(p=>p.id),mode:'max',pair_sensors:false});touch();renderTrackers();renderSeg()};
-  el.append(add);
-  el.insertAdjacentHTML('beforeend','<div class="hint">A tracker shows how far people are from each other. Pick 2 people for one distance, or a whole group and every pair is tracked. You get a drive-time sensor and a distance sensor; the rule above decides which pair they show, and the attributes list every pair (road and straight-line distance). Turn on per-pair sensors for a separate sensor for each combination.</div>');
+  el.append(addBtn('+ Add tracker',()=>{const id=rid();S.config.trackers.push({id,name:'',members:S.config.people.slice(0,2).map(p=>p.id),mode:'max',pair_sensors:false});OPEN.add('t'+id);touch();renderTrackers();renderSeg()}));
+  hint(el,'A tracker shows how far people are from each other. 2 people = one distance; a bigger group tracks every pair. You get a drive-time sensor and a distance sensor.');
 }
 function fillAll(){
   for(const p of S.config.people)for(const d of S.config.destinations)
@@ -1584,7 +1764,7 @@ function field(label,ctrl,hint){
 }
 function selCtl(opts,val,on){const s=document.createElement('select');s.innerHTML=opts.map(o=>Array.isArray(o)?`<option value="${esc(o[0])}">${esc(o[1])}</option>`:`<option>${esc(o)}</option>`).join('');s.value=val;s.onchange=()=>on(s.value);return s}
 function numCtl(val,on){const i=document.createElement('input');i.type='number';i.inputMode='numeric';i.value=val;i.oninput=()=>on(i.value);return i}
-function group(title,fields){const c=document.createElement('div');c.className='card';c.insertAdjacentHTML('beforeend',`<h2 style="margin-top:0">${title}</h2>`);fields.forEach(f=>c.append(f));return c}
+function group(title,fields){const b=body();fields.forEach(f=>b.append(f));return acc('set-'+title,title,'',b)}
 function renderSettings(){
   const el=$('#settings');el.innerHTML='';const s=S.config.settings;
   const set=k=>v=>{s[k]=v;touch()};
@@ -1606,9 +1786,8 @@ function renderSettings(){
     ai=selCtl([['','None (place search off)'],...opts.map(o=>[o.id,`${o.name} (${o.id})`])],s.ai_task_entity||'',set('ai_task_entity'));
   }else{ai=document.createElement('input');ai.placeholder='ai_task.your_entity';ai.value=s.ai_task_entity||'';ai.oninput=()=>{s.ai_task_entity=ai.value.trim();touch()}}
   el.append(group('AI place search',[field('AI Task entity',ai,S.ai_tasks.length?'Used by the Find tab':'No ai_task entities found. Add an AI Task provider (Google, OpenAI, Ollama…) or type the entity id')]));
-  const inf=document.createElement('div');inf.className='card';
-  inf.innerHTML=`<h2 style="margin-top:0">Connection</h2><div class="sub">MQTT broker: ${esc(S.info.mqtt)}<br>Log level: ${esc(S.info.log_level)}</div><div class="hint">Change these on the add-on's Configuration tab, then restart the add-on.</div>`;
-  el.append(inf);
+  const ib=body();ib.innerHTML=`<div class="sub">MQTT broker: ${esc(S.info.mqtt)}<br>Log level: ${esc(S.info.log_level)}</div><div class="hint">Change these on the add-on's Configuration tab, then restart the add-on.</div>`;
+  el.append(acc('set-conn','Connection','',ib));
 }
 function renderFind(){
   $('#fseg').innerHTML=[['quick','⚡ Address (fast)'],['ai','✨ AI search']].map(([k,l])=>`<button class="${fmode===k?'on':''}" onclick="setFind('${k}')">${l}</button>`).join('');
@@ -1722,16 +1901,16 @@ function renderLive(st){
       out+=`<div class="card"><div class="live"><div><b>📏 ${esc(names)}</b><div class="sub">${sb}</div></div><div class="big">${big}</div></div>${pr}</div>`;
     }
   }
-  const gl=S.config.groups.filter(g=>g.to&&g.members.length>1);
+  const gl=S.config.groups.filter(g=>g.members.length>1&&(g.destinations||[]).length);
   if(gl.length){
     out+='<h2>Groups</h2>';
-    for(const g of gl){
-      const x=st['g|'+g.id]||{};let big='…',sb='waiting for everyone\'s first calculation';
+    for(const g of gl)for(const did of g.destinations){
+      const x=st['g|'+gkey(g,did)]||{};let big='…',sb='waiting for everyone\'s first calculation';
       if(x.minutes!=null){
         big=x.arrived?'Here':Math.round(x.minutes)+' min';
         sb=x.members.map(m=>`${esc(m.name)} ${m.arrived?'here':Math.round(m.minutes)+' min'}`).join(' · ')+` · ${x.total_distance} ${x.unit||''} combined`;
       }
-      out+=`<div class="card live"><div><b>👥 ${esc(g.name||'(unnamed)')} → ${esc(nameOf(g.to))}</b><div class="sub">${sb}</div></div><div class="big">${big}</div></div>`;
+      out+=`<div class="card live"><div><b>👥 ${esc(g.name||'(unnamed)')} → ${esc(nameOf(did))}</b><div class="sub">${sb}</div></div><div class="big">${big}</div></div>`;
     }
   }
   for(const p of S.config.people){
@@ -1744,7 +1923,7 @@ function renderLive(st){
       out+=`<div class="card live"><div><b>→ ${esc(nameOf(r.to))}</b><div class="sub">${sb}</div></div><div class="big">${big}</div></div>`;
     }
   }
-  $('#live').innerHTML=out||'<div class="card"><div class="sub">Nothing to show yet. Open <b>Setup</b> to add people, places, routes and trackers, then Save.</div></div>';
+  $('#live').innerHTML=out||'<div class="card"><div class="sub">'+(S.admin?'Nothing to show yet. Open <b>Setup</b> to add people, places, routes and trackers, then Save.':'Nothing to show yet.')+'</div></div>';
 }
 async function save(){
   const r=await J('api/config',S.config);
