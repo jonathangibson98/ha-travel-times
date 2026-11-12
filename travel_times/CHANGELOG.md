@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.6.1
+- Fix "The /config folder is not available": newer Home Assistant mounts the config folder at /homeassistant. The card installer and the backup folder picker now find it either way.
+
 ## 1.6.0
 - Dashboard card: a compact, scrollable, resizable card for your dashboards (great for a TV). Shows routes, groups and trackers in one list, grouped by person or place, as a list or as tiles. Drag it to any size in sections view and it scrolls when the content doesn't fit.
 - Settings > Dashboard card: one tap installs the card file into /config/www and registers it as a dashboard resource; an installed card is kept up to date by the add-on automatically.
