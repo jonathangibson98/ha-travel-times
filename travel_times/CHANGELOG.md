@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.0
+- Dashboard card: a compact, scrollable, resizable card for your dashboards (great for a TV). Shows routes, groups and trackers in one list, grouped by person or place, as a list or as tiles. Drag it to any size in sections view and it scrolls when the content doesn't fit.
+- Settings > Dashboard card: one tap installs the card file into /config/www and registers it as a dashboard resource; an installed card is kept up to date by the add-on automatically.
+- Sensors now carry tt_kind / tt_from / tt_to attributes so the card (and your own templates) can tell routes, groups and trackers apart. Tap any row to open the sensor.
+
 ## 1.5.0
 - Groups can go to several places: pick any number of destinations on one group and each gets its own sensor ("Family to Home", "Family to Airport"). No more duplicate groups with the same members. Existing groups migrate automatically and keep their current sensor and history.
 - Routes tab is now organised by person. Tap a person's name to track every place for them, or tap individual place / person chips to switch a route on or off. "Clear" removes a person's routes.

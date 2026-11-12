@@ -41,3 +41,29 @@ The Backup tab saves your people, places, routes and settings as a JSON file. Pi
 add-on storage (default, included in Home Assistant backups), `/share`, `/media` or `/config`.
 Turn on daily or weekly automatic backups and choose how many files to keep. Restore replaces your current setup with the chosen file
 (the backup folder and schedule are kept). Note: new folder access needs the add-on to be rebuilt/updated once so the share, media and config mappings apply.
+
+## Dashboard card
+Settings > Dashboard card > **Install card** copies the card into `/config/www/travel-times-card/` and adds it to your dashboard resources
+(if `/config/www` didn't exist, restart Home Assistant once; if your dashboards are in YAML mode, add the resource shown yourself).
+Then add a **Travel Times** card from the card picker, or use YAML:
+
+```yaml
+type: custom:travel-times-card
+title: Travel Times
+layout: list          # list or tiles
+group_by: person      # person, place or none
+sort: name            # name or minutes
+people: [Jon, MJ]     # optional filter
+places: [Home, Work]  # optional filter
+show_groups: true
+show_trackers: true
+show_distance: true
+show_via: false
+warn_above: 30        # minutes, value turns orange
+alert_above: 60       # minutes, value turns red
+font_scale: 1.2       # bigger text for a TV
+columns: 3            # tiles layout
+max_height: 320       # px, for masonry views
+transparent: false
+```
+In a sections view, drag the card's corner to resize it; the list scrolls inside the card when it doesn't fit.
