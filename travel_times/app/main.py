@@ -542,6 +542,7 @@ def group_state(c, g, did, snap):
     minutes = round({"max": max(mins), "min": min(mins), "sum": sum(mins)}[mode], 1)
     now = datetime.now().astimezone()
     attrs = {
+        "tt_kind": "group", "tt_from": g["name"], "tt_to": d["name"],
         "mode": mode, "members": members, "member_count": len(members),
         "total_minutes": round(sum(mins), 1), "longest_minutes": round(max(mins), 1),
         "shortest_minutes": round(min(mins), 1),
@@ -707,6 +708,7 @@ def publish_trackers():
         ready = [x for x in r["pairs"] if x["minutes"] is not None]
         base = f"{BASE}/tracker/{t['id']}"
         attrs = {
+            "tt_kind": "tracker", "tt_from": t["name"], "distance": r["distance"],
             "mode": r["mode"], "pair_count": r["pair_count"], "pairs_ready": r["ready"],
             "together": r["together"], "distance_unit": r["unit"],
             "straight_line_distance": r["straight_line"],
@@ -836,6 +838,7 @@ def record_result(p, d, st, minutes, dist_m, via, s, arrived):
     st["via"] = via
     st["arrived"] = arrived
     st["attrs"] = {
+        "tt_kind": "route", "tt_from": p["name"], "tt_to": d["name"],
         "distance": dist,
         "distance_unit": unit,
         "route": via,
@@ -1282,6 +1285,104 @@ def is_admin():
     return any(i in admins for i in ident)
 
 
+# ----------------------------------------------------------- dashboard card
+# The card (app/card/travel-times-card.js) is copied into /config/www so Home Assistant serves it at
+# /local/..., then registered as a dashboard resource through the websocket API.
+CONFIG_DIR = os.environ.get("TT_CONFIG", "/config")
+CARD_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "card", "travel-times-card.js")
+CARD_DIR = os.path.join(CONFIG_DIR, "www", "travel-times-card")
+CARD_DEST = os.path.join(CARD_DIR, "travel-times-card.js")
+
+
+def card_version(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            m = re.search(r'TT_CARD_VERSION\s*=\s*"([^"]+)"', f.read(4000))
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def card_url():
+    return f"/local/travel-times-card/travel-times-card.js?v={card_version(CARD_SRC) or '1'}"
+
+
+def ha_ws_call(msg_type, **extra):
+    """One websocket command to Home Assistant; returns the raw reply message."""
+    if websocket is None:
+        raise RuntimeError("websocket-client is not installed")
+    ws = websocket.create_connection(os.environ.get("TT_WS", "ws://supervisor/core/websocket"), timeout=10)
+    try:
+        ws.recv()
+        ws.send(json.dumps({"type": "auth", "access_token": TOKEN}))
+        if json.loads(ws.recv()).get("type") != "auth_ok":
+            raise RuntimeError("Home Assistant refused the add-on token")
+        ws.send(json.dumps({"id": 1, "type": msg_type, **extra}))
+        while True:
+            m = json.loads(ws.recv())
+            if m.get("id") == 1:
+                return m
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def register_card_resource(url):
+    """(ok, message). Adds or updates the dashboard resource so the card shows up in the picker."""
+    try:
+        res = ha_ws_call("lovelace/resources")
+        if not res.get("success"):
+            return False, "Home Assistant would not list dashboard resources"
+        mine = [r for r in (res.get("result") or []) if "travel-times-card" in str(r.get("url", ""))]
+        if mine and mine[0].get("url") == url:
+            return True, "Resource already registered"
+        if mine:
+            r = ha_ws_call("lovelace/resources/update", resource_id=mine[0]["id"], res_type="module", url=url)
+        else:
+            r = ha_ws_call("lovelace/resources/create", res_type="module", url=url)
+        if r.get("success"):
+            return True, "Resource registered"
+        return False, str((r.get("error") or {}).get("message", "Home Assistant refused"))[:150]
+    except Exception as e:
+        return False, str(e)[:150]
+
+
+def card_status():
+    return {"available": card_version(CARD_SRC), "installed": card_version(CARD_DEST),
+            "config_mapped": os.path.isdir(CONFIG_DIR), "url": card_url().split("?")[0],
+            "www_exists": os.path.isdir(os.path.join(CONFIG_DIR, "www"))}
+
+
+def install_card():
+    if not os.path.isdir(CONFIG_DIR):
+        raise RuntimeError("The /config folder is not available to the add-on. Update to the latest version and restart it.")
+    www_new = not os.path.isdir(os.path.join(CONFIG_DIR, "www"))
+    os.makedirs(CARD_DIR, exist_ok=True)
+    with open(CARD_SRC, "rb") as f:
+        data = f.read()
+    with open(CARD_DEST, "wb") as f:
+        f.write(data)
+    ok, msg = register_card_resource(card_url())
+    return {"ok": True, "registered": ok, "message": msg, "restart_needed": www_new, "url": card_url(),
+            "version": card_version(CARD_DEST)}
+
+
+def refresh_card_if_installed():
+    """Keep an installed card in step with the add-on (called at startup)."""
+    try:
+        if os.path.isfile(CARD_DEST) and card_version(CARD_DEST) != card_version(CARD_SRC):
+            with open(CARD_SRC, "rb") as f:
+                data = f.read()
+            with open(CARD_DEST, "wb") as f:
+                f.write(data)
+            ok, msg = register_card_resource(card_url())
+            log.info("Dashboard card updated to %s (%s)", card_version(CARD_SRC), msg)
+    except Exception as e:
+        log.warning("Could not update the dashboard card: %s", e)
+
+
 # ------------------------------------------------------------------ Flask UI
 app = Flask(__name__)
 VIEWER_OK = {"/", "/api/config", "/api/status"}
@@ -1482,6 +1583,19 @@ def api_backup_download():
         body = f.read()
     return Response(body, mimetype="application/json",
                     headers={"Content-Disposition": f"attachment; filename={os.path.basename(p)}"})
+
+
+@app.get("/api/card")
+def api_card():
+    return jsonify(card_status())
+
+
+@app.post("/api/card/install")
+def api_card_install():
+    try:
+        return jsonify(install_card())
+    except Exception as e:
+        return jsonify(error=str(e)[:200]), 400
 
 
 @app.post("/api/refresh")
@@ -1788,6 +1902,34 @@ function renderSettings(){
   el.append(group('AI place search',[field('AI Task entity',ai,S.ai_tasks.length?'Used by the Find tab':'No ai_task entities found. Add an AI Task provider (Google, OpenAI, Ollama…) or type the entity id')]));
   const ib=body();ib.innerHTML=`<div class="sub">MQTT broker: ${esc(S.info.mqtt)}<br>Log level: ${esc(S.info.log_level)}</div><div class="hint">Change these on the add-on's Configuration tab, then restart the add-on.</div>`;
   el.append(acc('set-conn','Connection','',ib));
+  const cb=body();cb.innerHTML='<div class="sub">Checking…</div>';
+  el.append(acc('set-card','Dashboard card','Show travel times on any dashboard',cb));fillCard(cb);
+}
+const CARD_YAML=`type: custom:travel-times-card
+title: Travel Times
+layout: list        # list or tiles
+group_by: person    # person, place or none
+# people: [Jon, MJ]
+# warn_above: 30
+# font_scale: 1.2`;
+async function fillCard(el){
+  let i;try{i=await (await fetch('api/card')).json()}catch(e){el.innerHTML='<div class="sub err">Could not check the card</div>';return}
+  const st=!i.installed?'Not installed yet':(i.installed===i.available?`Installed (v${esc(i.installed)})`:`Update available: v${esc(i.installed)} to v${esc(i.available)}`);
+  el.innerHTML=`<div class="sub">${st}</div><div class="hint">Installs the card file and adds it to your dashboard resources. Then add a <b>Travel Times</b> card from the card picker, or paste the YAML below into a manual card. In sections view you can drag it to any size and it scrolls when the list is longer.</div>`;
+  const b=document.createElement('button');b.className='p';b.style.cssText='width:100%;margin:10px 0';b.textContent=i.installed?(i.installed===i.available?'Reinstall card':'Update card'):'Install card';
+  b.onclick=async()=>{
+    b.disabled=true;b.textContent='Installing…';
+    const j=await J('api/card/install');
+    if(j.error){toast(j.error,5000);b.disabled=false;b.textContent='Try again';return}
+    let m='Card installed.';
+    if(!j.registered)m+=' Add it manually under Settings > Dashboards > Resources: '+j.url;
+    if(j.restart_needed)m+=' Restart Home Assistant once so it can serve the new www folder.';
+    toast(m,8000);fillCard(el);
+  };
+  el.append(b);
+  const pre=document.createElement('pre');pre.textContent=CARD_YAML;pre.style.cssText='background:#12121f;border:1px solid var(--line);border-radius:10px;padding:10px;overflow:auto;font-size:12px;margin:0 0 8px';
+  const cp=document.createElement('button');cp.textContent='Copy YAML';cp.onclick=()=>{navigator.clipboard&&navigator.clipboard.writeText(CARD_YAML);toast('Copied')};
+  el.append(pre,cp);
 }
 function renderFind(){
   $('#fseg').innerHTML=[['quick','⚡ Address (fast)'],['ai','✨ AI search']].map(([k,l])=>`<button class="${fmode===k?'on':''}" onclick="setFind('${k}')">${l}</button>`).join('');
@@ -1991,6 +2133,7 @@ def main():
     os.makedirs(DATA, exist_ok=True)
     cfg = load_cfg()
     geocache = load_json(GEO_FILE, {})
+    refresh_card_if_installed()
     threading.Thread(target=start_mqtt, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
     log.info("Travel Times started")
