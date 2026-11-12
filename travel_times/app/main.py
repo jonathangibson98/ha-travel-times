@@ -946,11 +946,12 @@ def worker():
 # ------------------------------------------------------------------ backups
 STATE_FILE = os.path.join(DATA, "backup_state.json")
 BACKUP_RE = re.compile(r"^travel_times_backup_[A-Za-z0-9_\-]+\.json$")
-ROOT_LABELS = {DATA: "Add-on storage", "/share": "Share", "/media": "Media", "/config": "HA config"}
+ROOT_LABELS = {DATA: "Add-on storage", "/share": "Share", "/media": "Media", "/config": "HA config",
+               "/homeassistant": "HA config"}
 
 
 def backup_roots():
-    return [os.path.realpath(r) for r in (DATA, "/share", "/media", "/config") if os.path.isdir(r)]
+    return [os.path.realpath(r) for r in (DATA, "/share", "/media", "/config", "/homeassistant") if os.path.isdir(r)]
 
 
 def safe_dir(path):
@@ -1288,7 +1289,10 @@ def is_admin():
 # ----------------------------------------------------------- dashboard card
 # The card (app/card/travel-times-card.js) is copied into /config/www so Home Assistant serves it at
 # /local/..., then registered as a dashboard resource through the websocket API.
-CONFIG_DIR = os.environ.get("TT_CONFIG", "/config")
+# Newer Supervisors mount the HA config folder (map type homeassistant_config) at /homeassistant,
+# older ones at /config. Use whichever exists.
+CONFIG_DIR = os.environ.get("TT_CONFIG") or next(
+    (d for d in ("/homeassistant", "/config") if os.path.isdir(d)), "/homeassistant")
 CARD_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "card", "travel-times-card.js")
 CARD_DIR = os.path.join(CONFIG_DIR, "www", "travel-times-card")
 CARD_DEST = os.path.join(CARD_DIR, "travel-times-card.js")
@@ -1357,7 +1361,7 @@ def card_status():
 
 def install_card():
     if not os.path.isdir(CONFIG_DIR):
-        raise RuntimeError("The /config folder is not available to the add-on. Update to the latest version and restart it.")
+        raise RuntimeError("The Home Assistant config folder is not available to the add-on. Restart the add-on after updating; if it still fails, check the add-on log for map warnings.")
     www_new = not os.path.isdir(os.path.join(CONFIG_DIR, "www"))
     os.makedirs(CARD_DIR, exist_ok=True)
     with open(CARD_SRC, "rb") as f:
