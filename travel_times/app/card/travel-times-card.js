@@ -41,8 +41,16 @@
  *  LOOK
  *   transparent: false         # no card background
  *   hide_scrollbar: false
+ *
+ *  AUTO SCROLL (only moves when the list is taller than the card)
+ *   auto_scroll: false         # true turns it on
+ *   scroll_mode: continuous    # continuous (smooth, steady) | page (jumps one page at a time)
+ *   scroll_speed: 30           # px per second (continuous)
+ *   scroll_pause: 3            # seconds to wait at the top and at the bottom (continuous)
+ *   scroll_interval: 5         # seconds between page jumps (page)
+ *   scroll_resume: 10          # seconds to stay still after someone touches / scrolls the card
  */
-const TT_CARD_VERSION = "1.1.0";
+const TT_CARD_VERSION = "1.2.0";
 
 const ttEsc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const ttNum = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : NaN; };
@@ -67,6 +75,7 @@ const ttRatio = (v) => {
   const n = ttNum(v);
   return Number.isFinite(n) && n > 0 ? String(n) : null;
 };
+const ttNonNeg = (v, d) => { const n = ttNum(v); return Number.isFinite(n) && n >= 0 ? n : d; };
 const ttPos = (v, d) => { const n = ttNum(v); return Number.isFinite(n) && n > 0 ? n : d; };
 
 // Defaults. The editor drops any value equal to its default, so your YAML stays short.
@@ -80,6 +89,7 @@ const TT_DEFAULTS = {
   width: null, min_width: null, max_width: null, height: null, min_height: null, max_height: null,
   aspect_ratio: null, padding: null, gap: null, row_height: null, border_radius: null,
   columns: null, tile_min_width: null,
+  auto_scroll: false, scroll_mode: "continuous", scroll_speed: 30, scroll_pause: 3, scroll_interval: 5, scroll_resume: 10,
   people: null, places: null, entities: null,
 };
 const TT_KEYS = Object.keys(TT_DEFAULTS);
@@ -91,10 +101,15 @@ class TravelTimesCard extends HTMLElement {
     this._sig = "";
     this._count = 0;
     this._ro = null;
+    this._raf = null;
+    this._userUntil = 0;
   }
 
-  connectedCallback() { this._observe(); }
-  disconnectedCallback() { if (this._ro) { this._ro.disconnect(); this._ro = null; } }
+  connectedCallback() { this._observe(); this._startScroll(); }
+  disconnectedCallback() {
+    if (this._ro) { this._ro.disconnect(); this._ro = null; }
+    this._stopScroll();
+  }
 
   setConfig(config) {
     if (config.entities && !Array.isArray(config.entities)) throw new Error("entities must be a list");
@@ -197,6 +212,65 @@ class TravelTimesCard extends HTMLElement {
         <div class="bd"></div>
       </ha-card>`;
     this._observe();
+    this._startScroll();
+  }
+
+  _stopScroll() {
+    if (this._raf) cancelAnimationFrame(this._raf);
+    this._raf = null;
+  }
+
+  // Auto scroll. Only moves when the list is taller than the card. Touching / scrolling the card pauses it.
+  _startScroll() {
+    this._stopScroll();
+    const c = this._config;
+    if (!c || !c.auto_scroll || !this.isConnected) return;
+    const bd = this.shadowRoot.querySelector(".bd");
+    if (!bd) return;
+    const page = c.scroll_mode === "page";
+    const speed = ttPos(c.scroll_speed, 30);
+    const pause = ttNonNeg(c.scroll_pause, 3) * 1000;
+    const interval = Math.max(500, ttNonNeg(c.scroll_interval, 5) * 1000);
+    const resume = ttNonNeg(c.scroll_resume, 10) * 1000;
+    if (!bd._ttBound) {
+      bd._ttBound = true;
+      ["wheel", "touchstart", "pointerdown", "keydown"].forEach((ev) =>
+        bd.addEventListener(ev, () => { this._userUntil = performance.now() + (this._resumeMs || 0); }, { passive: true }));
+    }
+    this._resumeMs = resume;
+    const t0 = performance.now();
+    let phase = "wait", next = "run", until = t0 + (page ? interval : pause), pos = bd.scrollTop, last = t0;
+    const tick = (now) => {
+      this._raf = requestAnimationFrame(tick);
+      const dt = Math.min(100, now - last);
+      last = now;
+      if (document.hidden) return;
+      const max = bd.scrollHeight - bd.clientHeight;
+      if (max <= 1) { pos = 0; phase = "wait"; next = "run"; until = now + pause; return; }
+      if (now < this._userUntil) { pos = bd.scrollTop; until = Math.max(until, this._userUntil); return; }
+      if (page) {
+        if (now < until) return;
+        const top = bd.scrollTop;
+        const target = top >= max - 2 ? 0 : Math.min(max, top + Math.max(40, bd.clientHeight * 0.9));
+        bd.scrollTo({ top: target, behavior: "smooth" });
+        until = now + interval;
+        return;
+      }
+      if (phase === "wait") {
+        if (now < until) return;
+        if (next === "top") {
+          bd.scrollTo({ top: 0, behavior: "smooth" });
+          pos = 0; next = "run"; until = now + 900 + pause;
+        } else {
+          phase = "run"; pos = bd.scrollTop;
+        }
+        return;
+      }
+      pos += (speed * dt) / 1000;
+      if (pos >= max) { pos = max; bd.scrollTop = max; phase = "wait"; next = "top"; until = now + pause; return; }
+      bd.scrollTop = pos;
+    };
+    this._raf = requestAnimationFrame(tick);
   }
 
   // "shrink" mode: re-fit the text whenever the card's size changes (drag in sections view, window resize, TV).
@@ -345,7 +419,9 @@ class TravelTimesCard extends HTMLElement {
       html = order.map((k) => `<div class="sec">${ttEsc(secs.get(k).label)}</div>` +
         secs.get(k).rows.map((it) => row(it, this._rowTitle(it, byPlace))).join("")).join("");
     }
+    const keepTop = bd.scrollTop;
     bd.innerHTML = html;
+    bd.scrollTop = keepTop;
     bd.querySelectorAll("[data-e]").forEach((n) => {
       n.onclick = () => this.dispatchEvent(new CustomEvent("hass-more-info", { detail: { entityId: n.dataset.e }, bubbles: true, composed: true }));
     });
@@ -369,6 +445,8 @@ const TT_LABELS = {
   row_height: "Row / tile min height", border_radius: "Corner radius",
   columns: "Tile columns", tile_min_width: "Tile min width",
   transparent: "Transparent background", hide_scrollbar: "Hide scrollbar",
+  auto_scroll: "Auto scroll", scroll_mode: "Scroll style", scroll_speed: "Scroll speed",
+  scroll_pause: "Pause at top and bottom", scroll_interval: "Time between pages", scroll_resume: "Resume after touch",
 };
 const TT_HELP = {
   width: "px. Leave empty to fill the available width. YAML also accepts 50%, 30vw …",
@@ -384,6 +462,11 @@ const TT_HELP = {
   people: "Names as shown in the Travel Times add-on. Empty = everyone.",
   places: "Empty = all places.",
   entities: "Pick exact sensors. Empty = all Travel Times sensors.",
+  auto_scroll: "Only moves when the list is taller than the card.",
+  scroll_speed: "Pixels per second. Used by the continuous style.",
+  scroll_pause: "Seconds. Used by the continuous style.",
+  scroll_interval: "Seconds between page jumps. Used by the page style.",
+  scroll_resume: "Seconds to stay still after someone touches or scrolls the card.",
 };
 
 class TravelTimesCardEditor extends HTMLElement {
@@ -469,6 +552,16 @@ class TravelTimesCardEditor extends HTMLElement {
           px("tile_min_width", 800),
         ]),
       ]),
+      sect("Auto scroll", "mdi:arrow-down-bold-circle-outline", [
+        bool("auto_scroll"),
+        sel("scroll_mode", [{ value: "continuous", label: "Continuous (smooth, steady)" }, { value: "page", label: "Page by page" }]),
+        grid([
+          { name: "scroll_speed", selector: { number: { mode: "box", min: 1, max: 500, step: 1, unit_of_measurement: "px/s" } } },
+          { name: "scroll_pause", selector: { number: { mode: "box", min: 0, max: 300, step: 0.5, unit_of_measurement: "s" } } },
+          { name: "scroll_interval", selector: { number: { mode: "box", min: 1, max: 600, step: 0.5, unit_of_measurement: "s" } } },
+          { name: "scroll_resume", selector: { number: { mode: "box", min: 0, max: 3600, step: 1, unit_of_measurement: "s" } } },
+        ]),
+      ], true),
       sect("Look", "mdi:palette-outline", [bool("transparent"), bool("hide_scrollbar")]),
     ];
   }

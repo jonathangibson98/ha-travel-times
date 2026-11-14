@@ -91,6 +91,13 @@ tile_min_width: 136   # px, used when columns is not set
 # look
 transparent: false
 hide_scrollbar: false
+# auto scroll (only moves when the list is taller than the card)
+auto_scroll: true
+scroll_mode: continuous  # continuous or page
+scroll_speed: 30         # px per second (continuous)
+scroll_pause: 3          # seconds to wait at the top and bottom (continuous)
+scroll_interval: 5       # seconds between page jumps (page)
+scroll_resume: 10        # seconds to stay still after a touch / scroll
 ```
 
 Sizing tips:

@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.7.1
+- Dashboard card auto scroll: turn it on in the card editor (Auto scroll) and a long list scrolls by itself, great for a TV. Two styles: Continuous (smooth and steady, set the speed in px/s and how long it pauses at the top and bottom) or Page by page (jumps one page every N seconds). It only moves when the list is taller than the card, goes back to the top after the bottom, pauses when someone touches or scrolls the card and resumes after a time you choose.
+
 ## 1.7.0
 - Dashboard card sizing: set width, height, min/max width and height in px, or pick an aspect ratio (16:9, 4:3, 1:1 ...) and the height follows the width. Align a narrower card left, center or right.
 - New "When content is too big" option: Scroll, Shrink text to fit (text gets smaller until everything fits, resizes live as you drag the card) or Clip.
