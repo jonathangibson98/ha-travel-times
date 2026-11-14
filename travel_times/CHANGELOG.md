@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.0
+- Dashboard card sizing: set width, height, min/max width and height in px, or pick an aspect ratio (16:9, 4:3, 1:1 ...) and the height follows the width. Align a narrower card left, center or right.
+- New "When content is too big" option: Scroll, Shrink text to fit (text gets smaller until everything fits, resizes live as you drag the card) or Clip.
+- More card options: base text size in px, title and minutes-number size, padding, space between rows/tiles, row/tile min height, corner radius, tile min width, hide scrollbar.
+- The card now has a full visual editor: every option is in the card's own settings screen (Content, Filter, Size & fit, Text & spacing, Tiles, Look). People, places and sensors are picked from lists. No YAML needed.
+- max_height now limits the whole card (title included), not just the list.
+- In sections view a card with a px height or aspect ratio sizes itself (grid rows = auto). Without them you can still drag it to any size.
+
 ## 1.6.1
 - Fix "The /config folder is not available": newer Home Assistant mounts the config folder at /homeassistant. The card installer and the backup folder picker now find it either way.
 

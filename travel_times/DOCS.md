@@ -45,25 +45,55 @@ Turn on daily or weekly automatic backups and choose how many files to keep. Res
 ## Dashboard card
 Settings > Dashboard card > **Install card** copies the card into `/config/www/travel-times-card/` and adds it to your dashboard resources
 (if `/config/www` didn't exist, restart Home Assistant once; if your dashboards are in YAML mode, add the resource shown yourself).
-Then add a **Travel Times** card from the card picker, or use YAML:
+Then add a **Travel Times** card from the card picker. Every option is in the card's visual editor (Content, Filter, Size & fit,
+Text & spacing, Tiles, Look). You can also use YAML. Any option left out uses its default.
 
 ```yaml
 type: custom:travel-times-card
+# content
 title: Travel Times
 layout: list          # list or tiles
 group_by: person      # person, place or none
 sort: name            # name or minutes
 people: [Jon, MJ]     # optional filter
 places: [Home, Work]  # optional filter
+entities: []          # optional: only these sensors
 show_groups: true
 show_trackers: true
 show_distance: true
 show_via: false
+show_members: true
 warn_above: 30        # minutes, value turns orange
 alert_above: 60       # minutes, value turns red
-font_scale: 1.2       # bigger text for a TV
-columns: 3            # tiles layout
-max_height: 320       # px, for masonry views
+# size (numbers are px; "50%", "30vw", "20em" also work)
+width: 480
+height: 270
+min_width: 200
+max_width: 800
+min_height: 120
+max_height: 600
+aspect_ratio: "16:9"  # height follows the width (ignored when height is set)
+align: center         # left, center or right (when narrower than its space)
+fit: shrink           # scroll, shrink (text shrinks to fit) or clip
+min_font_scale: 0.5   # smallest text size when shrinking
+# text and spacing
+font_size: 14         # px
+font_scale: 1.2       # multiplier, bigger text for a TV
+title_scale: 1
+value_scale: 1
+padding: 8            # px
+gap: 8                # px between rows / tiles
+row_height: 40        # px, minimum height of each row / tile
+border_radius: 12     # px
+# tiles
+columns: 3
+tile_min_width: 136   # px, used when columns is not set
+# look
 transparent: false
+hide_scrollbar: false
 ```
-In a sections view, drag the card's corner to resize it; the list scrolls inside the card when it doesn't fit.
+
+Sizing tips:
+- **Exact px box:** set `width` and `height`. Add `fit: shrink` and the text scales down so everything is visible without scrolling.
+- **Keep a ratio:** set `aspect_ratio` (for example `16:9`) and leave `height` empty. Use `width` or `max_width` to choose how wide it is.
+- **Sections view:** with no px height or ratio you can drag the card's corner to resize it. With a px height or ratio the card sizes itself.
