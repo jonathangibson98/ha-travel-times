@@ -9,9 +9,9 @@
  *   layout: list               # list | tiles
  *   group_by: person           # person | place | none   (list layout)
  *   sort: name                 # name | minutes
- *   people: [Jon, MJ]          # optional filter (names as shown in Travel Times)
+ *   people: [Alex, Sam]          # optional filter (names as shown in Travel Times)
  *   places: [Home, Work]       # optional filter
- *   entities: [sensor.jon_to_work]   # optional: only these sensors
+ *   entities: [sensor.alex_to_work]   # optional: only these sensors
  *   show_groups / show_trackers / show_distance / show_via / show_members: true | false
  *   warn_above: 30             # minutes: value turns orange
  *   alert_above: 60            # minutes: value turns red

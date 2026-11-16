@@ -1770,7 +1770,7 @@ function renderPeople(){
   const el=$('#s-people');el.innerHTML='';
   S.config.people.forEach((p,i)=>{
     const b=body(),sub=()=>p.entity||'pick a location source',ttl=()=>p.name||'New person';
-    const nm=document.createElement('input');nm.placeholder='Name (Jon)';nm.value=p.name||'';
+    const nm=document.createElement('input');nm.placeholder='Name (Alex)';nm.value=p.name||'';
     const sel=document.createElement('select');
     const opts=[...S.trackers];if(p.entity&&!opts.find(o=>o.id===p.entity))opts.unshift({id:p.entity,name:p.entity});
     sel.innerHTML='<option value="">Pick a location source…</option>'+opts.map(o=>`<option value="${esc(o.id)}">${esc(o.name)} (${esc(o.id)})</option>`).join('');
@@ -1838,7 +1838,7 @@ function renderGroups(){
     g.destinations=g.destinations||[];
     const b=body(),ttl=()=>g.name||'New group';
     const sub=()=>`${g.members.length} people → ${g.destinations.length} place${g.destinations.length===1?'':'s'}`;
-    const nm=document.createElement('input');nm.placeholder='Group name (Jon & Sam)';nm.value=g.name||'';
+    const nm=document.createElement('input');nm.placeholder='Group name (Alex & Sam)';nm.value=g.name||'';
     const md=selCtl(MODES,g.mode||'max',v=>{g.mode=v;touch()});
     const rm=document.createElement('button');rm.className='d';rm.textContent='Remove group';rm.onclick=()=>{S.config.groups.splice(i,1);touch();renderGroups();renderSeg();renderLive(S.status)};
     const a=acc('g'+g.id,ttl(),sub(),b);
@@ -1913,7 +1913,7 @@ const CARD_YAML=`type: custom:travel-times-card
 title: Travel Times
 layout: list        # list or tiles
 group_by: person    # person, place or none
-# people: [Jon, MJ]
+# people: [Alex, Sam]
 # warn_above: 30
 # font_scale: 1.2`;
 async function fillCard(el){

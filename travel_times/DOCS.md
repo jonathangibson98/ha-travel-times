@@ -55,7 +55,7 @@ title: Travel Times
 layout: list          # list or tiles
 group_by: person      # person, place or none
 sort: name            # name or minutes
-people: [Jon, MJ]     # optional filter
+people: [Alex, Sam]     # optional filter
 places: [Home, Work]  # optional filter
 entities: []          # optional: only these sensors
 show_groups: true
