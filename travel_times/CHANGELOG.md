@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.7.2
+
+- Removed personal names, places and home-specific entity IDs from the defaults, examples and docs, so new installs start clean.
+
 ## 1.7.1
 - Dashboard card auto scroll: turn it on in the card editor (Auto scroll) and a long list scrolls by itself, great for a TV. Two styles: Continuous (smooth and steady, set the speed in px/s and how long it pauses at the top and bottom) or Page by page (jumps one page every N seconds). It only moves when the list is taller than the card, goes back to the top after the bottom, pauses when someone touches or scrolls the card and resumes after a time you choose.
 
