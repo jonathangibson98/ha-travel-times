@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.2 - 2026-11-17
+
+- **Easier to read over wallpapers.** The page checks how bright the wallpaper is and tints behind the text just enough to keep it readable: bright wallpapers get more, dark ones barely any.
+
 ## 1.9.1 - 2026-11-17
 
 - Uses the shared **add-on wallpaper** you pick in Photo Hub (new *Add-on wallpaper* tab). This add-on's own Wallpaper option still wins when set.

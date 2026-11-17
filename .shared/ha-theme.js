@@ -1,4 +1,4 @@
-/* HA Theme Bridge v1.2.0
+/* HA Theme Bridge v1.3.0
  * Makes an add-on web UI follow the active Home Assistant theme (colors, dark/light,
  * dashboard wallpaper, glass blur, card corners and shadows) and updates live when
  * the theme changes. It reads the theme from the Home Assistant page that holds the
@@ -9,6 +9,8 @@
  * The add-on option:
  *   empty = use the theme's wallpaper, "none" = no wallpaper, or an image:
  *   /local/pic.jpg (= /config/www/pic.jpg), just pic.jpg, /config/www/..., or https://...
+ * Readability: over a wallpaper it measures the picture's bright and dark areas and dims (dark
+ * themes) or lightens (light themes) it just enough for text to reach a 4.5:1 contrast.
  * Opt out on a page: <html data-ha-theme-off>
  * Variables you can use in new pages: --hb-bg --hb-card --hb-text --hb-text2 --hb-line
  * --hb-primary --hb-accent --hb-on --hb-error --hb-warning --hb-success --hb-field,
@@ -420,6 +422,60 @@
     return c[3] < 1 ? 'rgba(' + rgbStr(c) + ',' + (Math.round(c[3] * 1000) / 1000) + ')' : 'rgb(' + rgbStr(c) + ')';
   }
 
+  /* ---------- wallpaper readability ---------- */
+  var dimCache = {};           /* wallpaper url -> {dark: alpha, light: alpha} */
+  function lin(v) { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }
+  function relLum(c) { return 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]); }
+  function contrast(a, b) { return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05); }
+  function wallUrl(w) { var m = /url\(\s*["']?([^"')]+)["']?\s*\)/.exec(w || ''); return m ? m[1] : ''; }
+  /* smallest overlay alpha so text over the worst part of the picture still reads */
+  function needed(stats, th) {
+    /* browsers mix a see-through layer in screen (sRGB) values, so blend those, then measure */
+    var out = 0.12, bg = th.bg;
+    [[th.text, 4.5], [th.text2, 3.2]].forEach(function (t) {
+      var tl = relLum(t[0]), worst = tl > 0.5 ? stats.hi : stats.lo;
+      for (var a = 0.12; a <= 0.85; a += 0.02) {
+        var mix = [0, 1, 2].map(function (i) { return a * bg[i] + (1 - a) * worst[i]; });
+        if (contrast(tl, relLum(mix)) >= t[1]) { out = Math.max(out, a); return; }
+      }
+      out = Math.max(out, 0.85);
+    });
+    return Math.round(out * 100) / 100;
+  }
+  function measure(url, th) {
+    if (dimCache[url] || !window.Image) return;
+    dimCache[url] = { pending: true };
+    var img = new Image();
+    if (/^https?:/.test(url) && url.indexOf(location.origin) !== 0) img.crossOrigin = 'anonymous';
+    img.onload = function () {
+      try {
+        var cv = doc.createElement('canvas'), n = 48;
+        cv.width = cv.height = n;
+        var cx = cv.getContext('2d');
+        cx.drawImage(img, 0, 0, n, n);
+        var px = cx.getImageData(0, 0, n, n).data, ls = [];
+        for (var i = 0; i < px.length; i += 4) {
+          var c = [px[i], px[i + 1], px[i + 2]];
+          ls.push({ l: relLum(c), c: c });
+        }
+        ls.sort(function (a, b) { return a.l - b.l; });
+        /* 5% darkest / brightest areas: what text over the busiest part of the picture sits on */
+        dimCache[url] = { lo: ls[Math.floor(ls.length * 0.05)].c, hi: ls[Math.floor(ls.length * 0.95)].c };
+      } catch (e) { dimCache[url] = { failed: true }; }  /* other site without CORS: use a safe default */
+      lastKey = ''; apply();
+    };
+    img.onerror = function () { dimCache[url] = { failed: true }; };
+    img.src = url;
+  }
+  function dimFor(th) {
+    var url = wallUrl(th.wall);
+    if (!url) return 0;
+    var st = dimCache[url];
+    if (!st) { measure(url, th); return 0.35; }
+    if (st.pending || st.failed) return 0.35;
+    return needed(st, th);
+  }
+
   function apply() {
     var th;
     try { th = readTheme(); } catch (e) { return; }
@@ -458,8 +514,12 @@
     set('--hb-shadow', th.shadow);
     set('--hb-card-border', th.cardBorder);
     set('--hb-card-border-width', th.cardBorderW);
-    set('--hb-page', th.wall || css(th.bg));
+    var dim = th.wall ? dimFor(th) : 0, veil = 'rgba(' + rgbStr(th.bg) + ',' + dim + ')';
+    set('--hb-dim', String(dim));
+    set('--hb-page', th.wall ? (dim ? 'linear-gradient(' + veil + ',' + veil + ') fixed, ' : '') + th.wall : css(th.bg));
     root.style.setProperty('color-scheme', th.dark ? 'dark' : 'light');
+    /* a frame whose page and frame element disagree on color-scheme gets an opaque backdrop; keep them equal */
+    try { if (window.frameElement) window.frameElement.style.colorScheme = th.dark ? 'dark' : 'light'; } catch (e) { /* cross-origin */ }
     root.classList.toggle('hb-dark', th.dark);
     root.classList.toggle('hb-light', !th.dark);
     root.classList.toggle('hb-wallpaper', !!th.wall);
@@ -475,7 +535,9 @@
     s.textContent =
       'html.hb-themed{background:' + page + ' !important;min-height:100%}' +
       'html.hb-themed body{background:transparent !important;color:var(--hb-text)}' +
-      (th.wall ? 'html.hb-themed iframe{background:transparent !important}' : '') +
+      (th.wall ? 'html.hb-themed iframe{background:transparent !important}' +
+        'html.hb-themed.hb-wallpaper body{text-shadow:0 1px 3px rgba(' + rgbStr(th.bg) + ',.55)}' +
+        'html.hb-themed.hb-wallpaper input,html.hb-themed.hb-wallpaper textarea,html.hb-themed.hb-wallpaper select{text-shadow:none}' : '') +
       'html.hb-themed ::placeholder{color:var(--hb-text2);opacity:.8}';
     root.classList.add('hb-themed');
   }
