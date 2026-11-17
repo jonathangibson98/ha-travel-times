@@ -1669,16 +1669,18 @@ details.acc>.body{padding:14px}
 .item{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:12px 4px;border-bottom:1px solid var(--line);cursor:pointer;word-break:break-word}
 @media(min-width:700px){main{max-width:640px;margin:0 auto}}
 </style></head><body>
-<!-- ha-theme v1.1.0: copied from .shared/ha-theme.js, edit it there -->
+<!-- ha-theme v1.2.0: copied from .shared/ha-theme.js, edit it there -->
 <script>
 window.__hbAddon = "travel_times";
-/* HA Theme Bridge v1.1.0
+/* HA Theme Bridge v1.2.0
  * Makes an add-on web UI follow the active Home Assistant theme (colors, dark/light,
  * dashboard wallpaper, glass blur, card corners and shadows) and updates live when
  * the theme changes. It reads the theme from the Home Assistant page that holds the
  * add-on (ingress runs on the same origin) and remaps this page's own colors to it.
  * Opened outside Home Assistant it does nothing, so the page keeps its own look.
- * Wallpaper: the add-on's "wallpaper" option (Configuration tab) overrides the theme's:
+ * Wallpaper, first match wins: the add-on's own "wallpaper" option (Configuration tab), then the
+ * shared add-on wallpaper picked in Photo Hub (/local/addon-wallpaper/wallpaper.json), then the theme's.
+ * The add-on option:
  *   empty = use the theme's wallpaper, "none" = no wallpaper, or an image:
  *   /local/pic.jpg (= /config/www/pic.jpg), just pic.jpg, /config/www/..., or https://...
  * Opt out on a page: <html data-ha-theme-off>
@@ -2031,7 +2033,8 @@ window.__hbAddon = "travel_times";
   var BLUR_VARS = ['ha-card-backdrop-filter', 'card-backdrop-filter', 'ha-card-backdrop', 'backdrop-filter',
     'glass-blur', 'ha-blur', 'blur', 'card-blur', 'ha-card-blur'];
   var MOD_VARS = ['card-mod-card', 'card-mod-card-yaml', 'card-mod-root', 'card-mod-view', 'card-mod-row'];
-  var lastKey = '', copied = {}, wallOverride = null;   /* null = follow the theme */
+  var lastKey = '', copied = {}, wallOverride = null;   /* null = no add-on option set */
+  var globalWall = null;                               /* null = no shared wallpaper from Photo Hub */
 
   function themeSource() {
     var d = HA.document;
@@ -2074,6 +2077,7 @@ window.__hbAddon = "travel_times";
     th.wall = g('lovelace-background');
     if (th.wall && !/url\(|gradient\(/.test(th.wall) && !toRGB(th.wall)) th.wall = '';
     if (wallOverride !== null) th.wall = wallOverride;
+    else if (globalWall !== null) th.wall = globalWall;
     th.radius = g('ha-card-border-radius');
     th.shadow = g('ha-card-box-shadow');
     th.cardBorder = g('ha-card-border-color');
@@ -2204,6 +2208,17 @@ window.__hbAddon = "travel_times";
     }, find) : find()).then(function (info) { if (info) useInfo(info); }, function () {});
   }
 
+  /* ---------- shared add-on wallpaper (picked in Photo Hub) ---------- */
+  function loadGlobalWallpaper() {
+    if (!window.fetch) return;
+    fetch('/local/addon-wallpaper/wallpaper.json?t=' + Date.now(), { cache: 'no-store', credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        var next = d && d.url ? wallCss(d.url) : null;
+        if (next !== globalWall) { globalWall = next; lastKey = ''; apply(); }
+      }, function () {});
+  }
+
   /* ---------- run now, then follow changes ---------- */
   function run() { try { processSheets(); } catch (e) {} apply(); }
   run();
@@ -2229,10 +2244,11 @@ window.__hbAddon = "travel_times";
       }
     }).observe(doc.head || root, { childList: true });
   } catch (e) {}
-  doc.addEventListener('visibilitychange', function () { if (!doc.hidden) later(); });
+  doc.addEventListener('visibilitychange', function () { if (!doc.hidden) { later(); loadGlobalWallpaper(); } });
   window.addEventListener('load', later);
   try { loadWallpaperOption(); } catch (e) {}
-  window.haThemeBridge = { refresh: function () { lastKey = ''; run(); } };
+  try { loadGlobalWallpaper(); } catch (e) {}
+  window.haThemeBridge = { refresh: function () { lastKey = ''; run(); }, reloadWallpaper: loadGlobalWallpaper };
 })();
 </script>
 <!-- /ha-theme -->
