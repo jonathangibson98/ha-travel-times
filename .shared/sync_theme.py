@@ -21,15 +21,32 @@ SELF = {"ha-theme.js", "sync_theme.py"}
 EXTS = (".html", ".htm", ".py", ".js")
 
 
-def block():
+def addon_slug(path):
+    """Slug of the add-on folder a page belongs to (config.yaml/json above it), or ''."""
+    d = os.path.dirname(os.path.abspath(path))
+    while d.startswith(ROOT):
+        for name in ("config.yaml", "config.yml", "config.json"):
+            f = os.path.join(d, name)
+            if os.path.isfile(f):
+                m = re.search(r'["\']?slug["\']?\s*:\s*["\']?([a-z0-9_]+)', open(f, encoding="utf-8").read())
+                if m:
+                    return m.group(1)
+        if d == ROOT:
+            break
+        d = os.path.dirname(d)
+    return ""
+
+
+def block(slug=""):
     js = open(os.path.join(HERE, "ha-theme.js"), encoding="utf-8").read().strip()
     m = re.search(r"HA Theme Bridge v([\d.]+)", js)
     ver = m.group(1) if m else "?"
     for bad in ("{{", "{%", "{#", '"""', "</script"):
         if bad in js:
             sys.exit("ha-theme.js must not contain %r (it is pasted into templates and Python strings)" % bad)
-    return "%s v%s: copied from .shared/ha-theme.js, edit it there -->\n<script>\n%s\n</script>\n%s" % (
-        START, ver, js, END)
+    hint = 'window.__hbAddon = "%s";\n' % slug if slug else ""
+    return "%s v%s: copied from .shared/ha-theme.js, edit it there -->\n<script>\n%s%s\n</script>\n%s" % (
+        START, ver, hint, js, END)
 
 
 def update(path, text, new_block, add):
@@ -45,7 +62,7 @@ def update(path, text, new_block, add):
 
 
 def main():
-    new_block = block()
+    block()  # validates the script once
     add = [os.path.abspath(p) for p in sys.argv[1:]]
     targets = set(add)
     for d, dirs, files in os.walk(ROOT):
@@ -61,7 +78,7 @@ def main():
     changed = 0
     for p in sorted(targets):
         text = open(p, encoding="utf-8").read()
-        out = update(p, text, new_block, p in add)
+        out = update(p, text, block(addon_slug(p)), p in add)
         if out != text:
             open(p, "w", encoding="utf-8").write(out)
             changed += 1
