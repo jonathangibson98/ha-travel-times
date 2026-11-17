@@ -1,9 +1,12 @@
-/* HA Theme Bridge v1.0.0
+/* HA Theme Bridge v1.1.0
  * Makes an add-on web UI follow the active Home Assistant theme (colors, dark/light,
  * dashboard wallpaper, glass blur, card corners and shadows) and updates live when
  * the theme changes. It reads the theme from the Home Assistant page that holds the
  * add-on (ingress runs on the same origin) and remaps this page's own colors to it.
  * Opened outside Home Assistant it does nothing, so the page keeps its own look.
+ * Wallpaper: the add-on's "wallpaper" option (Configuration tab) overrides the theme's:
+ *   empty = use the theme's wallpaper, "none" = no wallpaper, or an image:
+ *   /local/pic.jpg (= /config/www/pic.jpg), just pic.jpg, /config/www/..., or https://...
  * Opt out on a page: <html data-ha-theme-off>
  * Variables you can use in new pages: --hb-bg --hb-card --hb-text --hb-text2 --hb-line
  * --hb-primary --hb-accent --hb-on --hb-error --hb-warning --hb-success --hb-field,
@@ -289,6 +292,8 @@
       ['top', 'right', 'bottom', 'left'].forEach(function (s) {
         var p = 'border-' + s + '-color', v = st.getPropertyValue(p);
         if (v === 'var(--hb-line)') st.setProperty(p, 'var(--hb-card-border,var(--hb-line))');
+        var pw = 'border-' + s + '-width', w = st.getPropertyValue(pw);
+        if (w && w.indexOf('--hb-') < 0) st.setProperty(pw, 'var(--hb-card-border-width,' + w + ')');
       });
     }
   }
@@ -352,7 +357,7 @@
   var BLUR_VARS = ['ha-card-backdrop-filter', 'card-backdrop-filter', 'ha-card-backdrop', 'backdrop-filter',
     'glass-blur', 'ha-blur', 'blur', 'card-blur', 'ha-card-blur'];
   var MOD_VARS = ['card-mod-card', 'card-mod-card-yaml', 'card-mod-root', 'card-mod-view', 'card-mod-row'];
-  var lastKey = '', copied = {};
+  var lastKey = '', copied = {}, wallOverride = null;   /* null = follow the theme */
 
   function themeSource() {
     var d = HA.document;
@@ -394,9 +399,11 @@
     th.info = toRGB(g('info-color')) || [3, 155, 229, 1];
     th.wall = g('lovelace-background');
     if (th.wall && !/url\(|gradient\(/.test(th.wall) && !toRGB(th.wall)) th.wall = '';
+    if (wallOverride !== null) th.wall = wallOverride;
     th.radius = g('ha-card-border-radius');
     th.shadow = g('ha-card-box-shadow');
     th.cardBorder = g('ha-card-border-color');
+    th.cardBorderW = g('ha-card-border-width');
     th.dark = th.wall ? lum(th.text) > 0.5 : lum(th.bg) < 0.5;
     return th;
   }
@@ -446,6 +453,7 @@
     set('--hb-radius', th.radius);
     set('--hb-shadow', th.shadow);
     set('--hb-card-border', th.cardBorder);
+    set('--hb-card-border-width', th.cardBorderW);
     set('--hb-page', th.wall || css(th.bg));
     root.style.setProperty('color-scheme', th.dark ? 'dark' : 'light');
     root.classList.toggle('hb-dark', th.dark);
@@ -466,6 +474,60 @@
       (th.wall ? 'html.hb-themed iframe{background:transparent !important}' : '') +
       'html.hb-themed ::placeholder{color:var(--hb-text2);opacity:.8}';
     root.classList.add('hb-themed');
+  }
+
+  /* ---------- per add-on wallpaper option ---------- */
+  function wallCss(v) {
+    v = String(v == null ? '' : v).trim();
+    if (!v || /^(theme|default|auto)$/i.test(v)) return null;
+    if (/^(none|off|no)$/i.test(v)) return '';
+    if (/url\(|gradient\(/.test(v)) return v;
+    v = v.replace(/^\/?(config|homeassistant)\/www\//, '/local/').replace(/^www\//, '/local/');
+    if (!/^(https?:)?\/\//.test(v) && v.charAt(0) !== '/') v = '/local/' + v;
+    return 'center / cover no-repeat fixed url("' + v.replace(/"/g, '%22') + '")';
+  }
+  function loadWallpaperOption() {
+    var m = /^\/api\/hassio_ingress\/[^/]+\//.exec(location.pathname);
+    var el = themeSource(), hass = el && el.hass;
+    if (!m || !hass || !hass.callWS || !(hass.user && hass.user.is_admin)) return;
+    var base = m[0], key = 'hb-addon:' + base, hint = window.__hbAddon || '';
+    var call = function (ep) {
+      return hass.callWS({ type: 'supervisor/api', endpoint: ep, method: 'get' });
+    };
+    var ingressOf = function (info) { return String((info && (info.ingress_url || info.ingress_entry)) || ''); };
+    var useInfo = function (info) {
+      var o = (info && info.options) || {};
+      wallOverride = 'wallpaper' in o ? wallCss(o.wallpaper) : null;
+      lastKey = '';
+      apply();
+    };
+    var cached = '';
+    try { cached = sessionStorage.getItem(key) || ''; } catch (e) {}
+    var find = function () {
+      return call('/addons').then(function (r) {
+        var list = (r && r.addons) || r || [], slugs = list.map(function (a) { return a.slug; });
+        if (hint) slugs.sort(function (a, b) {
+          var ha = a === hint || a.slice(-hint.length - 1) === '_' + hint, hb = b === hint || b.slice(-hint.length - 1) === '_' + hint;
+          return (hb ? 1 : 0) - (ha ? 1 : 0);
+        });
+        var i = 0;
+        var next = function () {
+          if (i >= slugs.length || i >= 60) return null;
+          var slug = slugs[i++];
+          return call('/addons/' + slug + '/info').then(function (info) {
+            if (ingressOf(info) && base.indexOf(ingressOf(info).replace(/\/?$/, '/')) === 0) {
+              try { sessionStorage.setItem(key, slug); } catch (e) {}
+              return info;
+            }
+            return next();
+          }, next);
+        };
+        return next();
+      });
+    };
+    (cached ? call('/addons/' + cached + '/info').then(function (info) {
+      return ingressOf(info) && base.indexOf(ingressOf(info).replace(/\/?$/, '/')) === 0 ? info : find();
+    }, find) : find()).then(function (info) { if (info) useInfo(info); }, function () {});
   }
 
   /* ---------- run now, then follow changes ---------- */
@@ -495,5 +557,6 @@
   } catch (e) {}
   doc.addEventListener('visibilitychange', function () { if (!doc.hidden) later(); });
   window.addEventListener('load', later);
+  try { loadWallpaperOption(); } catch (e) {}
   window.haThemeBridge = { refresh: function () { lastKey = ''; run(); } };
 })();

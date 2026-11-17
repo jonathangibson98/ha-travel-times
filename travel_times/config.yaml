@@ -1,5 +1,5 @@
 name: "Travel Times"
-version: "1.8.0"
+version: "1.9.0"
 slug: travel_times
 image: "ghcr.io/jonathangibson98/{arch}-addon-travel_times"
 description: "Near real-time Waze drive-time sensors for the routes you pick: person to place, person to person, groups, and distance trackers between people."
@@ -28,9 +28,11 @@ options:
   mqtt_user: ""
   mqtt_password: ""
   log_level: info
+  wallpaper: ""
 schema:
   mqtt_host: str?
   mqtt_port: int?
   mqtt_user: str?
   mqtt_password: password?
   log_level: list(debug|info|warning|error)
+  wallpaper: str?
