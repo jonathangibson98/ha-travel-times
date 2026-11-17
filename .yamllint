@@ -1,0 +1,20 @@
+extends: default
+
+ignore: |
+  node_modules/
+  .git/
+
+rules:
+  line-length: disable
+  document-start: disable
+  empty-lines:
+    max: 2
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false

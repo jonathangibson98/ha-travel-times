@@ -1,5 +1,16 @@
 name: Validate
 
+# Checks every Home Assistant add-on in this repo (any folder with a config.yaml/json that
+# has a `slug`). Runs on every push and pull request, by hand, and nightly so a broken
+# base image or upstream package is caught even when nothing was pushed.
+#
+#   Structure   required files and basic sanity checks
+#   Add-on lint Home Assistant's official add-on linter (config + schema)
+#   Dockerfile  Hadolint
+#   YAML        yamllint
+#   Python      syntax and obvious bugs
+#   Build       the image actually builds (amd64)
+
 on:
   push:
   pull_request:
@@ -7,20 +18,267 @@ on:
   schedule:
     - cron: "0 0 * * *"
 
-jobs:
-  hassfest:
-    name: Hassfest
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: home-assistant/actions/hassfest@master
+permissions:
+  contents: read
 
-  hacs:
-    name: HACS
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    name: Find add-ons
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+      has_addons: ${{ steps.find.outputs.has_addons }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Find add-ons
+        id: find
+        run: |
+          set -euo pipefail
+          entries='[]'
+
+          while IFS= read -r cfg; do
+            cfg="${cfg#./}"
+            dir="$(dirname "$cfg")"
+            cj="$(yq -o=json '.' "$cfg" 2>/dev/null || echo '{}')"
+            slug="$(jq -r 'if type=="object" then (.slug // empty) else empty end' <<<"$cj")"
+            [ -n "$slug" ] || continue
+            if [ "$dir" = "." ]; then df="Dockerfile"; else df="$dir/Dockerfile"; fi
+            name="$(jq -r '.name // empty' <<<"$cj")"; [ -n "$name" ] || name="$slug"
+
+            bj='{}'
+            for b in build.yaml build.yml build.json; do
+              if [ -f "$dir/$b" ]; then bj="$(yq -o=json '.' "$dir/$b")"; break; fi
+            done
+            bf="$(jq -r '.build_from.amd64 // empty' <<<"$bj")"
+            # Old per-arch bases no longer exist as multi-platform images.
+            bf="$(sed -E 's#^ghcr\.io/home-assistant/(amd64|aarch64|armv7|armhf|i386)-base#ghcr.io/home-assistant/base#' <<<"$bf")"
+
+            entries="$(jq -c \
+              --arg dir "$dir" --arg cfg "$cfg" --arg slug "$slug" --arg name "$name" \
+              --arg dockerfile "$df" --arg build_from "$bf" \
+              '. + [{dir:$dir, config:$cfg, slug:$slug, name:$name,
+                     dockerfile:$dockerfile, build_from:$build_from}]' <<<"$entries")"
+          done < <(find . -type f \( -name config.yaml -o -name config.yml -o -name config.json \) \
+                     -not -path './.git/*' -not -path '*/node_modules/*' | sort)
+
+          echo "Found $(jq 'length' <<<"$entries") add-on(s):"
+          jq -r '.[] | "  - \(.name) (\(.dir))"' <<<"$entries"
+
+          if [ "$(jq 'length' <<<"$entries")" = 0 ]; then
+            echo "has_addons=false" >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+          else
+            echo "has_addons=true" >> "$GITHUB_OUTPUT"
+            echo "matrix=$(jq -c '{include: .}' <<<"$entries")" >> "$GITHUB_OUTPUT"
+          fi
+
+  structure:
+    name: Structure
+    needs: discover
+    if: needs.discover.outputs.has_addons == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: hacs/action@main
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check repository and add-on files
+        env:
+          MATRIX: ${{ needs.discover.outputs.matrix }}
+        run: |
+          set -uo pipefail
+          fail=0
+          err()  { echo "::error file=$1::$2"; fail=1; }
+          warn() { echo "::warning file=$1::$2"; }
+
+          # repository.yaml
+          if [ ! -f repository.yaml ]; then
+            err repository.yaml "repository.yaml is missing"
+          else
+            for key in name url maintainer; do
+              [ -n "$(yq ".$key // \"\"" repository.yaml)" ] || err repository.yaml "repository.yaml has no '$key'"
+            done
+          fi
+          [ -f README.md ] || warn README.md "Repository README.md is missing"
+
+          seen=""
+          while IFS= read -r row; do
+            dir="$(jq -r '.dir' <<<"$row")"
+            cfg="$(jq -r '.config' <<<"$row")"
+            slug="$(jq -r '.slug' <<<"$row")"
+            cj="$(yq -o=json '.' "$cfg")"
+            echo "== $dir"
+
+            case " $seen " in *" $slug "*) err "$cfg" "Duplicate slug '$slug'" ;; esac
+            seen="$seen $slug"
+
+            version="$(jq -r '.version // empty' <<<"$cj")"
+            [ -n "$version" ] || err "$cfg" "No version"
+            [ -n "$(jq -r '.name // empty' <<<"$cj")" ] || err "$cfg" "No name"
+            [ -n "$(jq -r '.description // empty' <<<"$cj")" ] || err "$cfg" "No description"
+            [ -f "$dir/Dockerfile" ] || err "$dir" "Dockerfile is missing"
+
+            # Files that make the add-on look right in the store
+            [ -f "$dir/icon.png" ]     || warn "$dir" "icon.png is missing"
+            [ -f "$dir/logo.png" ]     || warn "$dir" "logo.png is missing"
+            [ -f "$dir/DOCS.md" ]      || warn "$dir" "DOCS.md is missing"
+            [ -f "$dir/CHANGELOG.md" ] || warn "$dir" "CHANGELOG.md is missing"
+            [ -f "$dir/README.md" ] || [ -f "$dir/DOCS.md" ] || warn "$dir" "No README.md or DOCS.md"
+
+            # Version should appear in the changelog
+            if [ -f "$dir/CHANGELOG.md" ] && [ -n "$version" ]; then
+              grep -qF "$version" "$dir/CHANGELOG.md" || warn "$dir/CHANGELOG.md" "Version $version is not in CHANGELOG.md"
+            fi
+
+            # Every file the Dockerfile copies from the add-on folder should exist
+            if [ -f "$dir/Dockerfile" ]; then
+              while read -r src; do
+                case "$src" in ""|--*|http*|/*) continue ;; esac
+                ls $dir/$src >/dev/null 2>&1 || err "$dir/Dockerfile" "COPY source '$src' not found in $dir"
+              done < <(grep -iE '^[[:space:]]*COPY[[:space:]]' "$dir/Dockerfile" | grep -v -- '--from=' \
+                         | sed -E 's/^[[:space:]]*COPY[[:space:]]+(--[^ ]+[[:space:]]+)*//' \
+                         | awk '{ for (i=1;i<NF;i++) print $i }')
+            fi
+
+            # Run script should be present and have a shebang if the Dockerfile uses it
+            if [ -f "$dir/run.sh" ]; then
+              head -n1 "$dir/run.sh" | grep -q '^#!' || err "$dir/run.sh" "run.sh has no shebang line"
+            fi
+          done < <(jq -c '.include[]' <<<"$MATRIX")
+
+          exit $fail
+
+  addon-lint:
+    name: Add-on lint (${{ matrix.name }})
+    needs: discover
+    if: needs.discover.outputs.has_addons == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Run Home Assistant add-on linter
+        uses: frenck/action-addon-linter@v2
         with:
-          category: integration
-          # remove this line once HACS stops complaining about brand images
-          ignore: brands
+          path: "./${{ matrix.dir }}"
+
+  hadolint:
+    name: Dockerfile (${{ matrix.name }})
+    needs: discover
+    if: needs.discover.outputs.has_addons == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: ${{ matrix.dockerfile }}
+          config: .hadolint.yaml
+
+  yamllint:
+    name: YAML
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Lint YAML files
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          config_file: .yamllint
+          file_or_dir: .
+          strict: false
+
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check syntax
+        run: |
+          set -euo pipefail
+          files="$(find . -name '*.py' -not -path './.git/*' -not -path '*/node_modules/*')"
+          if [ -z "$files" ]; then echo "No Python files"; exit 0; fi
+          echo "$files" | xargs python -m py_compile
+
+      - name: Check for obvious bugs (syntax errors, undefined names)
+        run: |
+          pip install --quiet ruff
+          ruff check --select E9,F63,F7,F82 --output-format=github .
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: discover
+    if: needs.discover.outputs.has_addons == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare build args
+        id: args
+        env:
+          BUILD_FROM: ${{ matrix.build_from }}
+        run: |
+          {
+            echo 'build_args<<EOF'
+            if [ -n "$BUILD_FROM" ]; then echo "BUILD_FROM=$BUILD_FROM"; fi
+            echo "BUILD_ARCH=amd64"
+            echo "BUILD_VERSION=test"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build image (not pushed)
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.dir }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          provenance: false
+          build-args: ${{ steps.args.outputs.build_args }}
+          cache-from: type=gha,scope=validate-${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=validate-${{ matrix.slug }}
+
+  result:
+    name: Validate result
+    # One check to require in branch protection.
+    if: always()
+    needs: [discover, structure, addon-lint, hadolint, yamllint, python, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "*|*" cancelled "*) echo "Some checks failed"; exit 1 ;;
+          esac
+          echo "All checks passed"
