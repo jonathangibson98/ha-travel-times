@@ -40,7 +40,7 @@ jobs:
       has_work: ${{ steps.find.outputs.has_work }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Log in to GHCR (to see which versions already exist)
         uses: docker/login-action@v3
@@ -135,7 +135,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
