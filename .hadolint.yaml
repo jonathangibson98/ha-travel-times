@@ -1,0 +1,11 @@
+# Add-on Dockerfiles use Home Assistant's base image through a build argument
+# and install Alpine packages without pinning versions, so these rules are off.
+failure-threshold: warning
+ignored:
+  - DL3006   # Always tag the version of an image (base comes from BUILD_FROM)
+  - DL3007   # Using latest is prone to errors
+  - DL3008   # Pin versions in apt-get install (slim base image, versions change often)
+  - DL3013   # Pin versions in pip
+  - DL3018   # Pin versions in apk add
+  - DL3042   # Avoid cache directory with pip
+  - DL3059   # Multiple consecutive RUN instructions
