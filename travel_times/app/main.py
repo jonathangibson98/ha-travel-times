@@ -96,6 +96,8 @@ DEFAULT_SETTINGS = {
     "arrival_radius_m": 150,     # inside this distance = arrived, time is 0
     "max_requests_per_min": 20,  # hard cap on Waze calls, all pairs combined
     "avoid_tolls": False,
+    "direction_window_s": 180,   # direction of travel looks back this many seconds
+    "direction_min_m": 50,       # less movement than this counts as stopped / not changing
     "ai_task_entity": "",        # ai_task.* entity used for place search
     "backup_dir": os.path.join(DATA, "backups"),
     "backup_auto": "off",        # off | daily | weekly
@@ -118,6 +120,10 @@ group_live = {}          # gid -> live info for the UI
 tracker_cache = {}       # tid -> last published payload
 tracker_live = {}        # tid -> live info for the UI
 person_locs = {}         # person id -> (lat, lon) from the latest tick
+dir_samples = {}         # direction series key -> deque of (time, distance, locations)
+dir_now = {}             # direction sensor key -> latest direction word
+dir_pub = {}             # direction sensor key -> (word, time published)
+dir_live = {}            # direction sensor key -> info for the UI
 search_cache = {}        # (query, near, quick) -> (time, results)
 _home_cache = {"t": 0.0, "pt": None}
 
@@ -552,6 +558,8 @@ def group_state(c, g, did, snap):
         "last_calculated": now.isoformat(timespec="seconds"),
         "destination": d["target"],
     }
+    if dir_now.get("g|" + group_key(g, did)):
+        attrs["direction"] = dir_now["g|" + group_key(g, did)]
     return minutes, attrs
 
 
@@ -566,7 +574,7 @@ def publish_groups():
                 continue
             key = group_key(g, did)
             minutes, attrs = res
-            ckey = json.dumps([minutes, attrs["members"], attrs["mode"]])
+            ckey = json.dumps([minutes, attrs["members"], attrs["mode"], attrs.get("direction")])
             with lock:
                 group_live[key] = {"minutes": minutes, "unit": attrs["distance_unit"], "t": time.time(),
                                    "members": attrs["members"], "total_distance": attrs["total_distance"],
@@ -700,7 +708,7 @@ def publish_trackers():
             tracker_live[t["id"]]["t"] = time.time()
         if r["minutes"] is None:
             continue  # nothing calculated yet
-        key = json.dumps([r["minutes"], r["distance"], r["straight_line"], r["mode"], r["unit"], r["pairs"]])
+        key = json.dumps([r["minutes"], r["distance"], r["straight_line"], r["mode"], r["unit"], r["pairs"], dir_now.get("t|" + t["id"])])
         with lock:
             if tracker_cache.get(t["id"]) == key:
                 continue
@@ -719,6 +727,8 @@ def publish_trackers():
             "pairs": [{k: v for k, v in x.items() if k != "key"} for x in r["pairs"]],
             "last_calculated": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
+        if dir_now.get("t|" + t["id"]):
+            attrs["direction"] = dir_now["t|" + t["id"]]
         pub(f"{base}/time", str(r["minutes"]))
         if r["distance"] is not None:
             pub(f"{base}/dist", str(r["distance"]))
@@ -729,6 +739,276 @@ def publish_trackers():
                 pub(f"{base}/pair/{x['key']}/attrs", json.dumps({
                     "between": [x["a"], x["b"]], "distance": x["distance"], "distance_unit": r["unit"],
                     "straight_line_distance": x["straight_line"], "arrived": x["arrived"]}))
+
+
+# ------------------------------------------------------- direction of travel
+# Optional, per route, group, tracker or person. Costs no Waze calls: it only watches the GPS
+# positions the add-on already reads every few seconds and compares the straight-line distance
+# now with the distance a little while ago (the window in Settings).
+DIR_ROUTE = ["toward", "away", "stopped", "arrived", "unknown"]
+DIR_GROUP = ["toward", "away", "mixed", "stopped", "arrived", "unknown"]
+DIR_TRACK = ["closing", "spreading", "steady", "together", "unknown"]
+COMPASS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+
+
+def bearing(a, b):
+    p1, p2 = math.radians(a[0]), math.radians(b[0])
+    dl = math.radians(b[1] - a[1])
+    x = math.sin(dl) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def compass(deg):
+    return COMPASS[int((deg + 22.5) // 45) % 8]
+
+
+def dir_wanted(c):
+    """What the config asks direction for: route pairs, (group, destination) pairs, trackers, people."""
+    people = {p["id"] for p in c["people"]}
+    ends = endpoints_of(c)
+    routes = {(r["from"], r["to"]) for r in c.get("routes", []) if r.get("direction")
+              and r["from"] in people and r["to"] in ends and r["from"] != r["to"]}
+    groups = [(g, did) for g in c.get("groups", []) if g.get("direction") for did in group_dests(g) if did in ends]
+    trackers = [t for t in c.get("trackers", []) if t.get("direction")]
+    heads = [p["id"] for p in c["people"] if p.get("heading")]
+    return routes, groups, trackers, heads
+
+
+def dir_pairs_needed(c):
+    """Every (person, endpoint) pair whose distance has to be watched."""
+    routes, groups, _, _ = dir_wanted(c)
+    need = set(routes)
+    for g, did in groups:
+        for m in g.get("members", []):
+            if m != did:
+                need.add((m, did))
+    return need
+
+
+def dir_topic(kind, key):
+    return f"homeassistant/sensor/{BASE}_dir_{kind}_{key}/config"
+
+
+def dir_topics(c):
+    routes, groups, trackers, heads = dir_wanted(c)
+    out = {dir_topic("r", f"{a}_{b}") for a, b in routes}
+    out |= {dir_topic("g", group_key(g, did)) for g, did in groups}
+    out |= {dir_topic("t", t["id"]) for t in trackers}
+    out |= {dir_topic("h", pid) for pid in heads}
+    return out
+
+
+def dir_sample(c):
+    """Record where everyone is, once per loop, for every series that is switched on."""
+    s = c["settings"]
+    now = time.time()
+    people = {p["id"]: p for p in c["people"]}
+    ends = endpoints_of(c)
+    routes, groups, trackers, heads = dir_wanted(c)
+    with lock:
+        locs = dict(person_locs)
+    series = {}
+
+    def point(eid):
+        if eid in locs:
+            return locs[eid]
+        d = ends.get(eid)
+        return resolve(d["target"]) if d and not d.get("is_person") else None
+
+    for a, b in dir_pairs_needed(c):
+        la, lb = locs.get(a), point(b)
+        if la and lb:
+            series[f"{a}|{b}"] = (haversine(la, lb), (la, lb))
+    for t in trackers:
+        pts = [locs.get(m) for m in t.get("members", [])]
+        ds = [haversine(x, y) for x, y in itertools.combinations([q for q in pts if q], 2)]
+        if ds:
+            mode = t.get("mode", "max")
+            series["t|" + t["id"]] = ({"max": max(ds), "min": min(ds), "avg": sum(ds) / len(ds)}[mode], tuple(pts))
+    for pid in heads:
+        if locs.get(pid):
+            series["h|" + pid] = (None, (locs[pid],))
+    with lock:
+        for k, (dist, pts) in series.items():
+            q = dir_samples.setdefault(k, deque())
+            q.append((now, dist, pts))
+        for k in list(dir_samples):
+            q = dir_samples[k]
+            while q and q[0][0] < now - s["direction_window_s"]:
+                q.popleft()
+            if k not in series and not q:
+                dir_samples.pop(k, None)
+
+
+def dir_metrics(key, s):
+    """(distance change, movement, seconds covered) over the window, or None while there is too little data."""
+    with lock:
+        q = list(dir_samples.get(key, ()))
+    if len(q) < 2:
+        return None
+    first, last = q[0], q[-1]
+    span = last[0] - first[0]
+    if span < min(20, s["direction_window_s"] / 3):
+        return None
+    delta = last[1] - first[1] if first[1] is not None and last[1] is not None else None
+    moved = [haversine(f, l) for f, l in zip(first[2], last[2]) if f and l]
+    if not moved:
+        return None
+    mv = max(moved)
+    head = bearing(first[2][0], last[2][0]) if first[2][0] and last[2][0] and moved[0] >= 1 else None
+    return {"delta": delta, "moved": mv, "span": span, "dist": last[1], "heading_deg": head, "own": moved[0]}
+
+
+def route_word(key, m, s):
+    """toward / away / stopped / arrived / unknown for one person and one place."""
+    if m is None:
+        return "unknown"
+    if m["dist"] is not None and m["dist"] <= s["arrival_radius_m"]:
+        return "arrived"
+    mn = s["direction_min_m"]
+    if m["moved"] < mn:
+        return "stopped"
+    if m["delta"] is not None and m["delta"] <= -mn:
+        return "toward"
+    if m["delta"] is not None and m["delta"] >= mn:
+        return "away"
+    prev = dir_now.get("w|" + key)  # moving sideways: keep what we last knew
+    return prev if prev in ("toward", "away") else "unknown"
+
+
+def dir_publish():
+    with lock:
+        c = json.loads(json.dumps(cfg))
+    s = c["settings"]
+    routes, groups, trackers, heads = dir_wanted(c)
+    if not (routes or groups or trackers or heads):
+        dir_now.clear()
+        return
+    people = {p["id"]: p for p in c["people"]}
+    ends = endpoints_of(c)
+    unit = "mi" if s["units"] == "imperial" else "km"
+    div = 1609.344 if unit == "mi" else 1000.0
+    now = time.time()
+    iso = datetime.now().astimezone().isoformat(timespec="seconds")
+    words = {}
+
+    def route_info(a, b):
+        key = f"{a}|{b}"
+        m = dir_metrics(key, s)
+        w = route_word(key, m, s)
+        dir_now["w|" + key] = w if w in ("toward", "away") else dir_now.get("w|" + key)
+        return m, w
+
+    def out(kind, key, topic_key, word, attrs, live_key):
+        dir_now[live_key] = word
+        attrs = dict(attrs, direction=word, window_seconds=s["direction_window_s"], last_calculated=iso)
+        last = dir_pub.get(live_key)
+        with lock:
+            dir_live[live_key] = {"direction": word, "t": now, **{k: attrs.get(k) for k in ("heading", "change", "speed")}}
+        if last and last[0] == word and now - last[1] < 30:
+            return
+        dir_pub[live_key] = (word, now)
+        pub(f"{BASE}/dir/{kind}/{key}/state", word)
+        pub(f"{BASE}/dir/{kind}/{key}/attrs", json.dumps(attrs))
+
+    def metrics_attrs(m):
+        if not m:
+            return {}
+        a = {"heading": compass(m["heading_deg"]) if m["heading_deg"] is not None and m["own"] >= s["direction_min_m"] else None}
+        if m["dist"] is not None:
+            a["straight_line_distance"] = round(m["dist"] / div, 2)
+        if m["delta"] is not None:
+            a["change"] = round(m["delta"] / div, 2)
+            a["closing_speed"] = round(-m["delta"] / m["span"] * 3600 / div, 1) if m["span"] else None
+        return a
+
+    for a, b in routes:
+        m, w = route_info(a, b)
+        with lock:
+            st = status.get(f"{a}|{b}")
+            if st and st.get("attrs") is not None and st["attrs"].get("direction") != w:
+                st["attrs"]["direction"] = w  # the card reads this attribute off the main sensor
+                publish_state(a, b, st)
+        out("r", f"{a}/{b}", f"{a}_{b}", w, {"tt_dir": "route", "from": people[a]["name"], "to": ends[b]["name"],
+                                              "distance_unit": unit, **metrics_attrs(m)}, f"{a}|{b}")
+    for g, did in groups:
+        ws, per = [], []
+        for mem in g.get("members", []):
+            if mem == did or mem not in people:
+                continue
+            m, w = route_info(mem, did)
+            ws.append(w)
+            per.append({"name": people[mem]["name"], "direction": w})
+        active = [x for x in ws if x in ("toward", "away")]
+        if ws and all(x == "arrived" for x in ws):
+            gw = "arrived"
+        elif active:
+            gw = active[0] if len(set(active)) == 1 else "mixed"
+        elif ws and all(x == "unknown" for x in ws):
+            gw = "unknown"
+        else:
+            gw = "stopped"
+        key = group_key(g, did)
+        out("g", key, key, gw, {"tt_dir": "group", "from": g["name"], "to": ends[did]["name"], "members": per}, "g|" + key)
+    for t in trackers:
+        m = dir_metrics("t|" + t["id"], s)
+        mn = s["direction_min_m"]
+        if m is None:
+            tw = "unknown"
+        elif m["dist"] is not None and m["dist"] <= s["arrival_radius_m"]:
+            tw = "together"
+        elif m["delta"] is not None and m["delta"] <= -mn:
+            tw = "closing"
+        elif m["delta"] is not None and m["delta"] >= mn:
+            tw = "spreading"
+        else:
+            tw = "steady"
+        out("t", t["id"], t["id"], tw, {"tt_dir": "tracker", "from": t["name"], "distance_unit": unit, **{k: v for k, v in metrics_attrs(m).items() if k != "heading"}}, "t|" + t["id"])
+    for pid in heads:
+        m = dir_metrics("h|" + pid, s)
+        if m is None:
+            hw, extra = "unknown", {}
+        elif m["moved"] < s["direction_min_m"] or m["heading_deg"] is None:
+            hw, extra = "stopped", {}
+        else:
+            hw = compass(m["heading_deg"])
+            kmh = m["moved"] / m["span"] * 3.6
+            extra = {"bearing": round(m["heading_deg"]), "speed": round(kmh / 1.609344 if unit == "mi" else kmh, 1),
+                     "speed_unit": "mph" if unit == "mi" else "km/h"}
+        out("h", pid, pid, hw, {"tt_dir": "heading", "from": people[pid]["name"], **extra}, "h|" + pid)
+    live_keys = {f"{a}|{b}" for a, b in routes} | {"g|" + group_key(g, d) for g, d in groups} | \
+                {"t|" + t["id"] for t in trackers} | {"h|" + p for p in heads}
+    for k in [k for k in list(dir_now) if not k.startswith("w|") and k not in live_keys]:
+        dir_now.pop(k, None)
+        dir_pub.pop(k, None)
+        with lock:
+            dir_live.pop(k, None)
+
+
+def publish_dir_discovery(c):
+    routes, groups, trackers, heads = dir_wanted(c)
+    people = {p["id"]: p for p in c["people"]}
+    ends = endpoints_of(c)
+
+    def disc(kind, key, name, entity, options, icon):
+        pub(dir_topic(kind, key.replace("/", "_")), json.dumps({
+            "name": name, "unique_id": f"{BASE}_dir_{kind}_{key.replace('/', '_')}",
+            "default_entity_id": f"sensor.{entity}", "state_topic": f"{BASE}/dir/{kind}/{key}/state",
+            "json_attributes_topic": f"{BASE}/dir/{kind}/{key}/attrs", "availability_topic": STATUS_TOPIC,
+            "device_class": "enum", "options": options, "icon": icon, "device": DEVICE}))
+
+    for a, b in routes:
+        disc("r", f"{a}/{b}", f"{people[a]['name']} direction to {ends[b]['name']}",
+             f"{slug(people[a]['name'])}_direction_to_{slug(ends[b]['name'])}", DIR_ROUTE, "mdi:compass-outline")
+    for g, did in groups:
+        key = group_key(g, did)
+        disc("g", key, f"{g['name']} direction to {ends[did]['name']}",
+             f"{slug(g['name'])}_direction_to_{slug(ends[did]['name'])}", DIR_GROUP, "mdi:compass-outline")
+    for t in trackers:
+        disc("t", t["id"], f"{t['name']} direction", f"{slug(t['name'])}_direction", DIR_TRACK, "mdi:arrow-collapse-horizontal")
+    for pid in heads:
+        disc("h", pid, f"{people[pid]['name']} heading", f"{slug(people[pid]['name'])}_heading", COMPASS + ["stopped", "unknown"], "mdi:compass")
 
 
 # --------------------------------------------------------------------- MQTT
@@ -781,6 +1061,8 @@ def republish_all():
         publish_tracker_discovery(c, t)
     tracker_cache.clear()
     publish_trackers()
+    publish_dir_discovery(c)
+    dir_pub.clear()
 
 
 def on_connect(client, userdata, flags, rc):
@@ -848,6 +1130,8 @@ def record_result(p, d, st, minutes, dist_m, via, s, arrived):
         "origin": p["entity"],
         "destination": d["target"],
     }
+    if dir_now.get(f"{p['id']}|{d['id']}"):
+        st["attrs"]["direction"] = dir_now[f"{p['id']}|{d['id']}"]
     if (p["id"], d["id"]) in pairs_of(cfg):
         publish_state(p["id"], d["id"], st)
 
@@ -936,6 +1220,14 @@ def worker():
             publish_trackers()
         except Exception:
             log.exception("tracker publish crashed")
+        try:
+            with lock:
+                c = json.loads(json.dumps(cfg))
+            if any(dir_wanted(c)):
+                dir_sample(c)
+                dir_publish()
+        except Exception:
+            log.exception("direction crashed")
         try:
             maybe_auto_backup()
         except Exception:
@@ -1041,7 +1333,7 @@ def clean_cfg(body):
         if name and ENTITY_RE.match(ent):
             pid = new_id(p.get("id"))
             idmap[str(p.get("id"))] = pid
-            people.append({"id": pid, "name": name, "entity": ent})
+            people.append({"id": pid, "name": name, "entity": ent, **({"heading": True} if p.get("heading") else {})})
     for d in (body.get("destinations") or [])[:50]:
         name, tgt = str(d.get("name", "")).strip()[:40], str(d.get("target", "")).strip()[:200]
         if name and tgt:
@@ -1056,7 +1348,7 @@ def clean_cfg(body):
         f, t = idmap.get(str(r.get("from"))), idmap.get(str(r.get("to")))
         if f in person_ids and t in valid_to and f != t and (f, t) not in done:
             done.add((f, t))
-            routes.append({"from": f, "to": t})
+            routes.append({"from": f, "to": t, **({"direction": True} if r.get("direction") else {})})
 
     groups = []
     for g in (body.get("groups") or [])[:20]:
@@ -1078,6 +1370,8 @@ def clean_cfg(body):
         if name and dl and len(members) >= 2:
             ng = {"id": new_id(g.get("id")), "name": name, "members": members[:8], "destinations": dl,
                   "mode": g.get("mode") if g.get("mode") in ("max", "min", "sum") else "max"}
+            if g.get("direction"):
+                ng["direction"] = True
             legacy = idmap.get(str(g.get("legacy") or (g.get("to") if g.get("destinations") is None else None)))
             if legacy in dl:
                 ng["legacy"] = legacy
@@ -1096,7 +1390,8 @@ def clean_cfg(body):
         name = str(t.get("name", "")).strip()[:40] or " & ".join(pname[m] for m in members)[:40]
         trackers.append({"id": new_id(t.get("id")), "name": name, "members": members,
                          "mode": t.get("mode") if t.get("mode") in TRACKER_MODES else "max",
-                         "pair_sensors": bool(t.get("pair_sensors"))})
+                         "pair_sensors": bool(t.get("pair_sensors")),
+                         **({"direction": True} if t.get("direction") else {})})
 
     b = body.get("settings") or {}
     s = dict(DEFAULT_SETTINGS)
@@ -1108,6 +1403,8 @@ def clean_cfg(body):
     s["move_threshold_m"] = clamp(b.get("move_threshold_m"), 50, 5000, 250)
     s["arrival_radius_m"] = clamp(b.get("arrival_radius_m"), 25, 2000, 150)
     s["max_requests_per_min"] = clamp(b.get("max_requests_per_min"), 1, 60, 20)
+    s["direction_window_s"] = clamp(b.get("direction_window_s"), 30, 900, 180)
+    s["direction_min_m"] = clamp(b.get("direction_min_m"), 10, 1000, 50)
     s["avoid_tolls"] = bool(b.get("avoid_tolls"))
     ai = str(b.get("ai_task_entity") or "").strip()
     s["ai_task_entity"] = ai if ENTITY_RE.match(ai) and ai.startswith("ai_task.") else ""
@@ -1145,6 +1442,11 @@ def apply_cfg(new):
         for tid in {t["id"] for t in old.get("trackers", [])} - {t["id"] for t in new.get("trackers", [])}:
             tracker_cache.pop(tid, None)
             tracker_live.pop(tid, None)
+        for topic in dir_topics(old) - dir_topics(new):
+            pub(topic, "")  # direction switched off or its item removed
+        for k in list(dir_samples):
+            dir_samples.pop(k, None)
+        dir_now.clear()
         cfg = new
         save_json(CFG_FILE, new)
     republish_all()
@@ -1415,6 +1717,8 @@ def status_public():
             out[f"g|{gid}"] = v
         for tid, v in tracker_live.items():
             out[f"t|{tid}"] = v
+        for k, v in dir_live.items():
+            out["d|" + k] = v
         return out
 
 
@@ -1429,7 +1733,7 @@ def viewer_config(c):
     names = lambda L: [{"id": x["id"], "name": x["name"]} for x in L]
     return {"people": names(c["people"]), "destinations": names(c["destinations"]),
             "routes": c["routes"], "groups": c["groups"],
-            "trackers": [{k: t[k] for k in ("id", "name", "members", "mode")} for t in c["trackers"]],
+            "trackers": [{k: t[k] for k in ("id", "name", "members", "mode", "direction") if k in t} for t in c["trackers"]],
             "settings": {"units": c["settings"]["units"]}}
 
 
@@ -2422,7 +2726,8 @@ function renderPeople(){
     sel.innerHTML='<option value="">Pick a location source…</option>'+opts.map(o=>`<option value="${esc(o.id)}">${esc(o.name)} (${esc(o.id)})</option>`).join('');
     sel.value=p.entity||'';
     const rm=document.createElement('button');rm.className='d';rm.textContent='Remove person';rm.onclick=()=>{dropRoutes(p.id);S.config.people.splice(i,1);touch();renderAll()};
-    b.append(lab('Name'),nm,lab('Location source'),sel,rm);
+    const hd=tgl('Heading sensor (which way they are moving)',!!p.heading,()=>{p.heading=!p.heading;hd.classList.toggle('on',!!p.heading);touch();renderLive(S.status)});
+    b.append(lab('Name'),nm,lab('Location source'),sel,lab('Extras'),hd,rm);
     const a=acc('p'+p.id,ttl(),sub(),b);
     nm.oninput=()=>{p.name=nm.value;a.setT(ttl(),sub());touch();refreshLists()};
     sel.onchange=()=>{p.entity=sel.value;a.setT(ttl(),sub());touch();renderSearchOpts()};
@@ -2473,10 +2778,21 @@ function renderRoutes(){
     if(D.length){c.append(lab('Places'));const w=document.createElement('div');w.className='chips';w.style.margin='6px 0 0';D.forEach(d=>w.append(tgl('📍 '+(d.name||'(unnamed)'),has(d.id),flip(d.id))));c.append(w)}
     const others=P.filter(o=>o.id!==p.id);
     if(others.length){c.append(lab('Follow a person live'));const w=document.createElement('div');w.className='chips';w.style.margin='6px 0 0';others.forEach(o=>w.append(tgl('👤 '+(o.name||'(unnamed)'),has(o.id),flip(o.id))));c.append(w)}
+    const mineR=R().filter(r=>r.from===p.id);
+    if(mineR.length){
+      c.append(lab('Direction of travel (optional): getting closer or moving away'));
+      const w=document.createElement('div');w.className='chips';w.style.margin='6px 0 0';
+      const allOn=mineR.every(r=>r.direction);
+      w.append(tgl(allOn?'✓ All':'All',allOn,()=>{mineR.forEach(r=>{if(allOn)delete r.direction;else r.direction=true});touch();renderRoutes();renderLive(S.status)}));
+      mineR.forEach(r=>w.append(tgl('🧭 '+nameOf(r.to),!!r.direction,()=>{if(r.direction)delete r.direction;else r.direction=true;touch();renderRoutes();renderLive(S.status)})));
+      c.append(w);
+    }
     el.append(c);
   });
-  hint(el,'Each highlighted chip is one sensor. Tap a name to track every place for that person, tap a chip to turn one on or off.');
+  hint(el,'Each highlighted chip is one sensor. Tap a name to track every place for that person, tap a chip to turn one on or off. Direction chips add one extra sensor each, with no extra Waze calls.');
 }
+const DW={toward:'⬆ getting closer',away:'⬇ moving away',stopped:'■ stopped',mixed:'⇅ mixed',closing:'⬆ closing in',spreading:'⬇ spreading apart',steady:'■ steady'};
+function dirTxt(st,key){const d=st['d|'+key];if(!d||!d.direction)return'';return DW[d.direction]||''}
 const MODES=[['max','Longest: when everyone has arrived'],['min','Shortest: first one there'],['sum','Combined total of everyone']];
 function renderGroups(){
   const el=$('#s-groups');el.innerHTML='';
@@ -2491,7 +2807,7 @@ function renderGroups(){
     const after=()=>{a.setT(ttl(),sub());renderLive(S.status)};
     b.append(lab('Name'),nm,lab('People (2 or more)'),chipset(pItems(),g.members,after),
       lab('Where to: pick as many as you like, one sensor each'),chipset([...dItems(),...pItems().map(([id,l])=>[id,l+' (live)'])],g.destinations,after),
-      lab('Sensor shows'),md,rm);
+      lab('Sensor shows'),md,lab('Extras'),tgl('Also track direction of travel',!!g.direction,function(){g.direction=!g.direction;this.classList.toggle('on',!!g.direction);touch();renderLive(S.status)}),rm);
     nm.oninput=()=>{g.name=nm.value;a.setT(ttl(),sub());touch();renderLive(S.status)};
     el.append(a);
   });
@@ -2510,7 +2826,7 @@ function renderTrackers(){
     const pairs=tgl('Also make a sensor for each pair',!!t.pair_sensors,()=>{t.pair_sensors=!t.pair_sensors;pairs.classList.toggle('on',t.pair_sensors);touch()});
     const rm=document.createElement('button');rm.className='d';rm.textContent='Remove tracker';rm.onclick=()=>{S.config.trackers.splice(i,1);touch();renderTrackers();renderSeg();renderLive(S.status)};
     const a=acc('t'+t.id,ttl(),sub(),b);
-    b.append(lab('Name'),nm,lab('People to track (2 or more, every pair is tracked)'),chipset(pItems(),t.members,()=>{a.setT(ttl(),sub());renderLive(S.status)}),lab('Sensors report'),md,lab('Extras'),pairs,rm);
+    b.append(lab('Name'),nm,lab('People to track (2 or more, every pair is tracked)'),chipset(pItems(),t.members,()=>{a.setT(ttl(),sub());renderLive(S.status)}),lab('Sensors report'),md,lab('Extras'),pairs,tgl('Also track direction (closing in or spreading apart)',!!t.direction,function(){t.direction=!t.direction;this.classList.toggle('on',!!t.direction);touch();renderLive(S.status)}),rm);
     nm.oninput=()=>{t.name=nm.value;a.setT(ttl(),sub());touch();renderLive(S.status)};
     el.append(a);
   });
@@ -2541,6 +2857,9 @@ function renderSettings(){
     field('While moving: update every (sec)',numCtl(s.moving_interval,set('moving_interval')),'Minimum 20. This is your "real-time" speed'),
     field('While parked: update every (sec)',numCtl(s.idle_interval,set('idle_interval')),'Used when nobody is going anywhere'),
     field('Counts as moving after (m)',numCtl(s.move_threshold_m,set('move_threshold_m')),'Distance moved since the last calculation')]));
+  el.append(group('Direction of travel',[
+    field('Look back (sec)',numCtl(s.direction_window_s,set('direction_window_s')),'Direction compares where someone is now with this long ago. Shorter reacts faster, longer is steadier'),
+    field('Needs at least (m)',numCtl(s.direction_min_m,set('direction_min_m')),'Moving or closing in less than this counts as stopped or steady, so GPS wobble does not flip it')]));
   el.append(group('Arrival & limits',[
     field('Arrived within (m)',numCtl(s.arrival_radius_m,set('arrival_radius_m')),'Inside this the sensor is 0 and no Waze call is made'),
     field('Max Waze calls per minute',numCtl(s.max_requests_per_min,set('max_requests_per_min')),'Safety cap for all routes combined')]));
@@ -2684,6 +3003,7 @@ function renderLive(st){
         big=x.together?'Together':Math.round(x.minutes)+' min';
         const bits=[];if(x.distance!=null)bits.push(`${x.distance} ${u} by road`);if(x.straight_line!=null)bits.push(`${x.straight_line} ${u} straight`);
         if(t.members.length>2)bits.push(ML[x.mode]||'');
+        const dt=t.direction?dirTxt(st,'t|'+t.id):'';if(dt)bits.push(dt);
         sb=bits.join(' · ');
       }else if(x.straight_line!=null)sb=`${x.straight_line} ${u} straight-line · waiting for drive time`;
       let pr='';
@@ -2701,16 +3021,20 @@ function renderLive(st){
       if(x.minutes!=null){
         big=x.arrived?'Here':Math.round(x.minutes)+' min';
         sb=x.members.map(m=>`${esc(m.name)} ${m.arrived?'here':Math.round(m.minutes)+' min'}`).join(' · ')+` · ${x.total_distance} ${x.unit||''} combined`;
+        const dt=g.direction?dirTxt(st,'g|'+gkey(g,did)):'';if(dt)sb+=' · '+dt;
       }
       out+=`<div class="card live"><div><b>👥 ${esc(g.name||'(unnamed)')} → ${esc(nameOf(did))}</b><div class="sub">${sb}</div></div><div class="big">${big}</div></div>`;
     }
   }
   for(const p of S.config.people){
-    if(!by[p.id])continue;out+=`<h2>${esc(p.name||'(unnamed)')}</h2>`;
+    if(!by[p.id]&&!p.heading)continue;out+=`<h2>${esc(p.name||'(unnamed)')}</h2>`;
+    if(p.heading){const h=st['d|h|'+p.id]||{};out+=`<div class="card live"><div><b>🧭 Heading</b><div class="sub">${h.direction&&h.direction!=='unknown'?(h.direction==='stopped'?'not moving':'moving '+esc(h.direction)):'waiting for movement'}</div></div><div class="big">${esc(h.direction&&h.direction!=='unknown'&&h.direction!=='stopped'?h.direction:'–')}</div></div>`}
+    if(!by[p.id])continue;
     for(const r of by[p.id]){
       const x=st[r.from+'|'+r.to]||{};let big='…',sb='waiting for first calculation';
       if(x.minutes!=null){big=x.arrived?'Here':Math.round(x.minutes)+' min';
-        sb=(x.arrived?'arrived':`${x.distance} ${x.unit}${x.via?' via '+esc(x.via):''}`)+' · '+ago(x.t)}
+        sb=(x.arrived?'arrived':`${x.distance} ${x.unit}${x.via?' via '+esc(x.via):''}`)+' · '+ago(x.t);
+        const dt=r.direction?dirTxt(st,r.from+'|'+r.to):'';if(dt)sb+=' · '+dt}
       if(x.error)sb=`<span class="err">${esc(x.error)}</span>`+(x.minutes!=null?' · last good '+ago(x.t):'');
       out+=`<div class="card live"><div><b>→ ${esc(nameOf(r.to))}</b><div class="sub">${sb}</div></div><div class="big">${big}</div></div>`;
     }
