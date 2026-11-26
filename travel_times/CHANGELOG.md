@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.10.0 - 2026-11-25
+
+- **Optional direction of travel, on anything you choose.** Is someone getting closer, moving away or stopped? It costs no extra Waze calls: it watches the GPS positions the add-on already reads and compares the straight-line distance now with a little while ago.
+  - **Routes:** on the Routes tab, tap the 🧭 chips under a person (or **All**). Each one adds a sensor like `sensor.alex_direction_to_work` (`toward`, `away`, `stopped`, `arrived`, `unknown`) with the distance change, closing speed and which way they are heading.
+  - **Groups:** turn on *Also track direction of travel*. The sensor says `toward` or `away` when everyone who is moving agrees, `mixed` when they don't, `stopped` or `arrived`.
+  - **Trackers:** turn on the direction extra to get `closing`, `spreading`, `steady` or `together` for how far apart the people are.
+  - **People:** *Heading sensor* gives a compass direction (N, NE, E ...) while they move, plus speed.
+  - The route, group and tracker sensors you already have also gain a `direction` attribute when it is on, and the dashboard card shows it (new **Show direction of travel** option).
+  - Settings > Direction of travel: how many seconds to look back (default 180) and how far counts as movement (default 50 m), so GPS wobble does not flip it back and forth.
+
 ## 1.9.2 - 2026-11-17
 
 - **Easier to read over wallpapers.** The page checks how bright the wallpaper is and tints behind the text just enough to keep it readable: bright wallpapers get more, dark ones barely any.

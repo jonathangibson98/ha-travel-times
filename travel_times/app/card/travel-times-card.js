@@ -81,7 +81,7 @@ const ttPos = (v, d) => { const n = ttNum(v); return Number.isFinite(n) && n > 0
 // Defaults. The editor drops any value equal to its default, so your YAML stays short.
 const TT_DEFAULTS = {
   title: "Travel Times", show_title: true, layout: "list", group_by: "person", sort: "name",
-  show_distance: true, show_via: false, show_groups: true, show_trackers: true, show_members: true,
+  show_distance: true, show_direction: true, show_via: false, show_groups: true, show_trackers: true, show_members: true,
   warn_above: null, alert_above: null,
   fit: "scroll", align: "left", min_font_scale: 0.5,
   font_size: 14, font_scale: 1, title_scale: 1, value_scale: 1,
@@ -93,6 +93,8 @@ const TT_DEFAULTS = {
   people: null, places: null, entities: null,
 };
 const TT_KEYS = Object.keys(TT_DEFAULTS);
+
+const TT_DIR = { toward: "⬆ closer", away: "⬇ moving away", stopped: "■ stopped", mixed: "⇅ mixed", closing: "⬆ closing in", spreading: "⬇ spreading apart", steady: "■ steady" };
 
 class TravelTimesCard extends HTMLElement {
   constructor() {
@@ -326,6 +328,7 @@ class TravelTimesCard extends HTMLElement {
         arrived: a.arrived === true, dist: a.distance, unit: a.distance_unit || "",
         via: a.route || "", members: Array.isArray(a.members) ? a.members : [],
         pairs: Array.isArray(a.pairs) ? a.pairs : [],
+        dir: typeof a.direction === "string" ? a.direction : "",
       };
       if (pf) {
         const names = [it.from, ...it.members.map((m) => m.name), ...it.pairs.flatMap((p) => [p.a, p.b])].map(ttLow);
@@ -365,6 +368,8 @@ class TravelTimesCard extends HTMLElement {
     } else if (it.kind === "tracker") {
       if (it.dist != null) p.push(`${it.dist} ${it.unit} apart`);
     }
+    const dw = TT_DIR[it.dir];
+    if (c.show_direction && dw && !it.arrived) p.push(dw);
     return p.join(" · ");
   }
 
@@ -433,7 +438,7 @@ class TravelTimesCard extends HTMLElement {
 const TT_LABELS = {
   title: "Title", show_title: "Show title", layout: "Layout", group_by: "Group by (list)", sort: "Sort by",
   people: "Only these people", places: "Only these places", entities: "Only these sensors",
-  show_groups: "Show groups", show_trackers: "Show trackers (between people)", show_distance: "Show distance",
+  show_groups: "Show groups", show_trackers: "Show trackers (between people)", show_distance: "Show distance", show_direction: "Show direction of travel",
   show_via: "Show road name", show_members: "Show each person inside a group",
   warn_above: "Orange above (minutes)", alert_above: "Red above (minutes)",
   width: "Width", min_width: "Min width", max_width: "Max width",
@@ -517,7 +522,7 @@ class TravelTimesCardEditor extends HTMLElement {
           sel("group_by", [{ value: "person", label: "Person" }, { value: "place", label: "Place" }, { value: "none", label: "No grouping" }]),
           sel("sort", [{ value: "name", label: "Name" }, { value: "minutes", label: "Minutes (shortest first)" }]),
         ]),
-        grid([bool("show_groups"), bool("show_trackers"), bool("show_distance"), bool("show_via"), bool("show_members")]),
+        grid([bool("show_groups"), bool("show_trackers"), bool("show_distance"), bool("show_direction"), bool("show_via"), bool("show_members")]),
         grid([
           { name: "warn_above", selector: { number: { mode: "box", min: 0, max: 1440, step: 1, unit_of_measurement: "min" } } },
           { name: "alert_above", selector: { number: { mode: "box", min: 0, max: 1440, step: 1, unit_of_measurement: "min" } } },

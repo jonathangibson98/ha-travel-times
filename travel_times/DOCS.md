@@ -24,6 +24,14 @@
   Results are only as good as the model's knowledge; a model with web search gives the best results.
 - Save. Sensors appear under Settings > Devices & services > MQTT.
 
+## Direction of travel (optional)
+Switch it on only where you want it. It adds one sensor each and uses no extra Waze calls: it compares the straight-line distance now with the distance a few minutes ago (Settings > Direction of travel).
+- Routes: Routes tab > the 🧭 chips under each person (or **All**). Sensor `sensor.<person>_direction_to_<place>`: `toward`, `away`, `stopped`, `arrived` or `unknown`. Attributes: `heading`, `change` and `closing_speed` (negative change = getting closer).
+- Groups: *Also track direction of travel*. `toward` or `away` when everyone who is moving agrees, otherwise `mixed`.
+- Trackers: the direction extra gives `closing`, `spreading`, `steady` or `together`.
+- People: *Heading sensor* gives a compass direction while they move, with speed.
+- Driving past a place sideways keeps the last known direction instead of flipping. Straight-line distance can say `away` for a moment on a winding road that has to curve away from the place first.
+
 ## How "real time" works
 Every 5s the add-on reads each person's GPS from HA. If someone moved more than the threshold since the last
 Waze call, the pair refreshes every "moving" interval (default 60s). Otherwise every "parked" interval (default 10 min).
@@ -61,6 +69,7 @@ entities: []          # optional: only these sensors
 show_groups: true
 show_trackers: true
 show_distance: true
+show_direction: true  # shows toward / away / stopped when direction is switched on
 show_via: false
 show_members: true
 warn_above: 30        # minutes, value turns orange
